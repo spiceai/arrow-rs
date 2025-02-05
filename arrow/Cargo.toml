@@ -39,19 +39,19 @@ path = "src/lib.rs"
 bench = false
 
 [dependencies]
-arrow-arith = { workspace = true }
-arrow-array = { workspace = true }
-arrow-buffer = { workspace = true }
-arrow-cast = { workspace = true }
-arrow-csv = { workspace = true, optional = true }
-arrow-data = { workspace = true }
-arrow-ipc = { workspace = true, optional = true }
-arrow-json = { workspace = true, optional = true }
-arrow-ord = { workspace = true }
-arrow-row = { workspace = true }
-arrow-schema = { workspace = true }
-arrow-select = { workspace = true }
-arrow-string = { workspace = true }
+arrow-arith = { version = "53" }
+arrow-array = { version = "53" }
+arrow-buffer = { version = "53" }
+arrow-cast = { version = "53" }
+arrow-csv = { version = "53", optional = true }
+arrow-data = { version = "53" }
+arrow-ipc = { version = "53", optional = true }
+arrow-json = { version = "53", optional = true }
+arrow-ord = { version = "53" }
+arrow-row = { version = "53" }
+arrow-schema = { version = "53" }
+arrow-select = { version = "53" }
+arrow-string = { version = "53" }
 
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"], optional = true }
 pyo3 = { version = "0.22.2", default-features = false, optional = true }

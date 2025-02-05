@@ -41,11 +41,11 @@ prettyprint = ["comfy-table"]
 force_validate = []
 
 [dependencies]
-arrow-array = { workspace = true }
-arrow-buffer = { workspace = true }
-arrow-data = { workspace = true }
-arrow-schema = { workspace = true }
-arrow-select = { workspace = true }
+arrow-array = { version = "53" }
+arrow-buffer = { version = "53" }
+arrow-data = { version = "53" }
+arrow-schema = { version = "53" }
+arrow-select = { version = "53" }
 chrono = { workspace = true }
 half = { version = "2.1", default-features = false }
 num = { version = "0.4", default-features = false, features = ["std"] }
