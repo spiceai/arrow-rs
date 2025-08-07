@@ -288,7 +288,7 @@ pub struct ArrowReaderOptions {
     skip_arrow_metadata: bool,
     /// If provided used as the schema for the file, otherwise the schema is read from the file
     supplied_schema: Option<SchemaRef>,
-    /// If true, attempt to read `OffsetIndex` and `ColumnIndex`
+    /// Policy for reading offset and column indexes.
     pub(crate) page_index_policy: PageIndexPolicy,
     /// If encryption is enabled, the file decryption properties can be provided
     #[cfg(feature = "encryption")]
