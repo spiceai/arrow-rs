@@ -19,12 +19,12 @@ use std::{io::Read, ops::Range, sync::Arc};
 
 use bytes::Bytes;
 
+use crate::basic::ColumnOrder;
 #[cfg(feature = "encryption")]
 use crate::encryption::{
     decrypt::{FileDecryptionProperties, FileDecryptor},
     modules::create_footer_aad,
 };
-use crate::{basic::ColumnOrder, file::page_index::offset_index::OffsetIndexMetaData};
 
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{FileMetaData, ParquetMetaData, RowGroupMetaData};
@@ -574,33 +574,37 @@ impl ParquetMetaDataReader {
     fn parse_offset_index(&mut self, bytes: &Bytes, start_offset: u64) -> Result<()> {
         let metadata = self.metadata.as_mut().unwrap();
         if self.offset_index != PageIndexPolicy::Skip {
-            let index = metadata
-                .row_groups()
-                .iter()
-                .map(|x| {
-                    x.columns()
-                        .iter()
-                        .map(|c| match c.offset_index_range() {
-                            Some(r) => {
-                                let r_start = usize::try_from(r.start - start_offset)?;
-                                let r_end = usize::try_from(r.end - start_offset)?;
-                                decode_offset_index(&bytes[r_start..r_end])
-                            }
-                            None => {
-                                if self.offset_index == PageIndexPolicy::Required {
-                                    return Err(general_err!("missing offset index"));
-                                }
-                                Ok(OffsetIndexMetaData {
-                                    page_locations: vec![],
-                                    unencoded_byte_array_data_bytes: None,
-                                })
-                            }
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let row_groups = metadata.row_groups();
+            let mut all_indexes = Vec::with_capacity(row_groups.len());
+            for x in row_groups {
+                let mut row_group_indexes = Vec::with_capacity(x.columns().len());
+                for c in x.columns() {
+                    let result = match c.offset_index_range() {
+                        Some(r) => {
+                            let r_start = usize::try_from(r.start - start_offset)?;
+                            let r_end = usize::try_from(r.end - start_offset)?;
+                            decode_offset_index(&bytes[r_start..r_end])
+                        }
+                        None => Err(general_err!("missing offset index")),
+                    };
 
-            metadata.set_offset_index(Some(index));
+                    match result {
+                        Ok(index) => row_group_indexes.push(index),
+                        Err(e) => {
+                            if self.offset_index == PageIndexPolicy::Required {
+                                return Err(e);
+                            } else {
+                                // Invalidate and return
+                                metadata.set_column_index(None);
+                                metadata.set_offset_index(None);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                all_indexes.push(row_group_indexes);
+            }
+            metadata.set_offset_index(Some(all_indexes));
         }
         Ok(())
     }
