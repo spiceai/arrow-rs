@@ -238,6 +238,7 @@ impl AsyncFileReader for ParquetObjectReader {
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
         Box::pin(async move {
+            #[allow(unused_mut)] // mut is used in the feature
             let mut metadata = ParquetMetaDataReader::new()
                 .with_column_indexes(self.preload_column_index)
                 .with_offset_indexes(self.preload_offset_index)
