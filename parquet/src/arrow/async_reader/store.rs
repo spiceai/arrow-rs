@@ -23,6 +23,7 @@ use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt, TryFutureExt};
+use object_store::path::Path;
 use object_store::ObjectStore;
 use object_store::{GetOptions, GetRange, ObjectMeta};
 use tokio::runtime::Handle;
@@ -55,7 +56,7 @@ pub enum ObjectVersionType {
 /// println!("Found Blob with {}B at {}", meta.size, meta.location);
 ///
 /// // Show Parquet metadata
-/// let reader = ParquetObjectReader::new(storage_container, meta);
+/// let reader = ParquetObjectReader::new_with_meta(storage_container, meta);
 /// let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
 /// print_parquet_metadata(&mut stdout(), builder.metadata());
 /// # }
@@ -73,7 +74,30 @@ pub struct ParquetObjectReader {
 
 impl ParquetObjectReader {
     /// Creates a new [`ParquetObjectReader`] for the provided [`ObjectStore`] and [`Path`].
-    pub fn new(store: Arc<dyn ObjectStore>, object_meta: ObjectMeta) -> Self {
+    #[deprecated(
+        note = "use ParquetObjectReader::new_with_meta_with_meta to provide ObjectMeta including size"
+    )]
+    pub fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
+        let object_meta = ObjectMeta {
+            location: path,
+            last_modified: Default::default(),
+            size: 0,
+            e_tag: None,
+            version: None,
+        };
+
+        Self::new_with_meta(store, object_meta)
+    }
+
+    #[deprecated(
+        note = "use ParquetObjectReader::new_with_meta_with_meta to provide ObjectMeta including size"
+    )]
+    pub fn with_file_size(mut self, size: u64) -> Self {
+        self.object_meta.size = size;
+        self
+    }
+
+    pub fn new_with_meta(store: Arc<dyn ObjectStore>, object_meta: ObjectMeta) -> Self {
         Self {
             store,
             object_meta,
@@ -266,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple() {
         let (meta, store) = get_meta_store().await;
-        let object_reader = ParquetObjectReader::new(store, meta);
+        let object_reader = ParquetObjectReader::new_with_meta(store, meta);
 
         let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
             .await
@@ -280,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple_without_file_length() {
         let (meta, store) = get_meta_store().await;
-        let object_reader = ParquetObjectReader::new(store, meta);
+        let object_reader = ParquetObjectReader::new_with_meta(store, meta);
 
         let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
             .await
@@ -296,7 +320,7 @@ mod tests {
         let (mut meta, store) = get_meta_store().await;
         meta.location = Path::from("I don't exist.parquet");
 
-        let object_reader = ParquetObjectReader::new(store, meta);
+        let object_reader = ParquetObjectReader::new_with_meta(store, meta);
         // Cannot use unwrap_err as ParquetRecordBatchStreamBuilder: !Debug
         match ParquetRecordBatchStreamBuilder::new(object_reader).await {
             Ok(_) => panic!("expected failure"),
@@ -329,7 +353,8 @@ mod tests {
 
         let initial_actions = num_actions.load(Ordering::Relaxed);
 
-        let reader = ParquetObjectReader::new(store, meta).with_runtime(rt.handle().clone());
+        let reader =
+            ParquetObjectReader::new_with_meta(store, meta).with_runtime(rt.handle().clone());
 
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
         let batches: Vec<_> = builder.build().unwrap().try_collect().await.unwrap();
@@ -355,7 +380,8 @@ mod tests {
 
         let (meta, store) = get_meta_store().await;
 
-        let reader = ParquetObjectReader::new(store, meta).with_runtime(rt.handle().clone());
+        let reader =
+            ParquetObjectReader::new_with_meta(store, meta).with_runtime(rt.handle().clone());
 
         let current_id = std::thread::current().id();
 
@@ -378,7 +404,8 @@ mod tests {
 
         let (meta, store) = get_meta_store().await;
 
-        let mut reader = ParquetObjectReader::new(store, meta).with_runtime(rt.handle().clone());
+        let mut reader =
+            ParquetObjectReader::new_with_meta(store, meta).with_runtime(rt.handle().clone());
 
         rt.shutdown_background();
 
