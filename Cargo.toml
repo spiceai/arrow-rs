@@ -116,3 +116,6 @@ simdutf8 = { version = "0.1.5", default-features = false }
 inherits = "release"
 debug = true
 strip = false
+
+[patch.crates-io]
+object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }
