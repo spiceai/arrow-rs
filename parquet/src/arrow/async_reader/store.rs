@@ -86,9 +86,12 @@ impl ParquetObjectReader {
     }
 
     /// Set the object versioning type to use when retrieving objects from the object store.
-    pub fn with_object_versioning_type(self, object_versioning_type: ObjectVersionType) -> Self {
+    pub fn with_object_versioning_type(
+        self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
         Self {
-            object_versioning_type: Arc::new(Some(object_versioning_type)),
+            object_versioning_type: Arc::new(object_versioning_type),
             ..self
         }
     }
