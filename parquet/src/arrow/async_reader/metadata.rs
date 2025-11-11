@@ -71,6 +71,7 @@ pub trait MetadataFetch {
 
 impl<T: AsyncFileReader> MetadataFetch for &mut T {
     fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+        println!("MetadataFetch fetching range");
         self.get_bytes(range)
     }
 }
