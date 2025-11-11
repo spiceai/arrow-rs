@@ -202,7 +202,7 @@ impl MetadataSuffixFetch for &mut ParquetObjectReader {
                 }
             };
 
-            println!("Fetching with versioning: {object_versioning_type:?}");
+            println!("Metadata with versioning: {object_versioning_type:?}");
         }
 
         self.spawn(|store, meta| {
