@@ -203,6 +203,8 @@ impl MetadataSuffixFetch for &mut ParquetObjectReader {
             };
 
             println!("Metadata with versioning: {object_versioning_type:?}");
+        } else {
+            println!("Metadata without versioning");
         }
 
         self.spawn(|store, meta| {
@@ -225,8 +227,6 @@ impl AsyncFileReader for ParquetObjectReader {
                     ObjectVersionType::ETag => opts.with_if_match(meta.e_tag.as_deref()),
                     ObjectVersionType::Version => opts.with_version(meta.version.as_deref()),
                 };
-
-                println!("Fetching with versioning: {object_versioning_type:?}");
 
                 store
                     .get_opts(&meta.location, opts)

@@ -772,6 +772,7 @@ impl ParquetMetaDataReader {
         // Note: prefetch > file_size is ok since we're using saturating_sub.
         let footer_start = file_size.saturating_sub(prefetch);
 
+        println!("Fetch");
         let suffix = fetch.fetch(footer_start..file_size).await?;
         let suffix_len = suffix.len();
         let fetch_len = (file_size - footer_start)
@@ -825,6 +826,7 @@ impl ParquetMetaDataReader {
     ) -> Result<(ParquetMetaData, Option<(usize, Bytes)>)> {
         let prefetch = self.get_prefetch_size();
 
+        println!("Fetch suffix");
         let suffix = fetch.fetch_suffix(prefetch as _).await?;
         let suffix_len = suffix.len();
 
