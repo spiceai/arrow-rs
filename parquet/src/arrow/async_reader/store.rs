@@ -192,10 +192,17 @@ impl ParquetObjectReader {
 
 impl MetadataSuffixFetch for &mut ParquetObjectReader {
     fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, Result<Bytes>> {
-        let options = GetOptions {
-            range: Some(GetRange::Suffix(suffix as u64)),
-            ..Default::default()
-        };
+        let mut options = GetOptions::default().with_range(Some(GetRange::Suffix(suffix as u64)));
+
+        if let Some(object_versioning_type) = self.object_versioning_type.as_ref() {
+            options = match object_versioning_type {
+                ObjectVersionType::ETag => options.with_if_match(self.object_meta.e_tag.as_deref()),
+                ObjectVersionType::Version => {
+                    options.with_version(self.object_meta.version.as_deref())
+                }
+            };
+        }
+
         self.spawn(|store, meta| {
             async move {
                 let resp = store.get_opts(&meta.location, options).await?;
