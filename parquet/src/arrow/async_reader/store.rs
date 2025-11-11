@@ -261,8 +261,11 @@ impl AsyncFileReader for ParquetObjectReader {
                     .with_decryption_properties(options.file_decryption_properties.as_ref());
             }
 
-            let file_size = self.file_size.unwrap_or(self.object_meta.size);
-            let metadata = metadata.load_and_finish(self, file_size).await?;
+            let metadata = if let Some(file_size) = self.file_size {
+                metadata.load_and_finish(self, file_size).await?
+            } else {
+                metadata.load_via_suffix_and_finish(self).await?
+            };
 
             Ok(Arc::new(metadata))
         })
