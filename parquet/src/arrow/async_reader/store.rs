@@ -200,10 +200,6 @@ impl MetadataSuffixFetch for &mut ParquetObjectReader {
                     options.with_version(self.object_meta.version.as_deref())
                 }
             };
-
-            println!("Metadata with versioning: {object_versioning_type:?}");
-        } else {
-            println!("Metadata without versioning");
         }
 
         self.spawn(|store, meta| {
