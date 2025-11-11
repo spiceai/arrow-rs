@@ -65,6 +65,7 @@ pub enum ObjectVersionType {
 pub struct ParquetObjectReader {
     store: Arc<dyn ObjectStore>,
     object_meta: ObjectMeta,
+    file_size: Option<u64>,
     metadata_size_hint: Option<usize>,
     preload_column_index: bool,
     preload_offset_index: bool,
@@ -89,11 +90,8 @@ impl ParquetObjectReader {
         Self::new_with_meta(store, object_meta)
     }
 
-    #[deprecated(
-        note = "use ParquetObjectReader::new_with_meta_with_meta to provide ObjectMeta including size"
-    )]
     pub fn with_file_size(mut self, size: u64) -> Self {
-        self.object_meta.size = size;
+        self.file_size = Some(size);
         self
     }
 
@@ -101,6 +99,7 @@ impl ParquetObjectReader {
         Self {
             store,
             object_meta,
+            file_size: None,
             metadata_size_hint: None,
             preload_column_index: false,
             preload_offset_index: false,
@@ -192,10 +191,17 @@ impl ParquetObjectReader {
 
 impl MetadataSuffixFetch for &mut ParquetObjectReader {
     fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, Result<Bytes>> {
-        let options = GetOptions {
-            range: Some(GetRange::Suffix(suffix as u64)),
-            ..Default::default()
-        };
+        let mut options = GetOptions::default().with_range(Some(GetRange::Suffix(suffix as u64)));
+
+        if let Some(object_versioning_type) = self.object_versioning_type.as_ref() {
+            options = match object_versioning_type {
+                ObjectVersionType::ETag => options.with_if_match(self.object_meta.e_tag.as_deref()),
+                ObjectVersionType::Version => {
+                    options.with_version(self.object_meta.version.as_deref())
+                }
+            };
+        }
+
         self.spawn(|store, meta| {
             async move {
                 let resp = store.get_opts(&meta.location, options).await?;
@@ -250,8 +256,11 @@ impl AsyncFileReader for ParquetObjectReader {
                     .with_decryption_properties(options.file_decryption_properties.as_ref());
             }
 
-            let file_size = self.object_meta.size;
-            let metadata = metadata.load_and_finish(self, file_size).await?;
+            let metadata = if let Some(file_size) = self.file_size {
+                metadata.load_and_finish(self, file_size).await?
+            } else {
+                metadata.load_via_suffix_and_finish(self).await?
+            };
 
             Ok(Arc::new(metadata))
         })
