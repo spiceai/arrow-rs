@@ -118,4 +118,4 @@ debug = true
 strip = false
 
 [patch.crates-io]
-object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }
+object_store = { path = "/Users/lukim/dev/arrow-rs-object-store" }

@@ -191,14 +191,18 @@ impl ParquetObjectReader {
 
 impl MetadataSuffixFetch for &mut ParquetObjectReader {
     fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, Result<Bytes>> {
-        let mut options = GetOptions::default().with_range(Some(GetRange::Suffix(suffix as u64)));
+        let mut options = GetOptions::default().with_range(GetRange::Suffix(suffix as u64));
 
         if let Some(object_versioning_type) = self.object_versioning_type.as_ref() {
             options = match object_versioning_type {
-                ObjectVersionType::ETag => options.with_if_match(self.object_meta.e_tag.as_deref()),
-                ObjectVersionType::Version => {
-                    options.with_version(self.object_meta.version.as_deref())
-                }
+                ObjectVersionType::ETag => match self.object_meta.e_tag.as_ref() {
+                    Some(etag) => options.with_if_match(etag),
+                    None => options,
+                },
+                ObjectVersionType::Version => match self.object_meta.version.as_ref() {
+                    Some(version) => options.with_version(version),
+                    None => options,
+                },
             };
         }
 
@@ -217,10 +221,16 @@ impl AsyncFileReader for ParquetObjectReader {
         let object_versioning_type = Arc::clone(&self.object_versioning_type);
         self.spawn(move |store, meta| {
             if let Some(object_versioning_type) = object_versioning_type.as_ref() {
-                let opts = GetOptions::default().with_range(Some(range));
+                let opts = GetOptions::default().with_range(range);
                 let opts = match object_versioning_type {
-                    ObjectVersionType::ETag => opts.with_if_match(meta.e_tag.as_deref()),
-                    ObjectVersionType::Version => opts.with_version(meta.version.as_deref()),
+                    ObjectVersionType::ETag => match meta.e_tag.as_ref() {
+                        Some(etag) => opts.with_if_match(etag),
+                        None => opts,
+                    },
+                    ObjectVersionType::Version => match meta.version.as_ref() {
+                        Some(version) => opts.with_version(version),
+                        None => opts,
+                    },
                 };
 
                 store
