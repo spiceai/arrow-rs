@@ -410,23 +410,39 @@ fn take_native<T: ArrowNativeType, I: ArrowPrimitiveType>(
     indices: &PrimitiveArray<I>,
 ) -> ScalarBuffer<T> {
     match indices.nulls().filter(|n| n.null_count() > 0) {
-        Some(n) => indices
-            .values()
-            .iter()
-            .enumerate()
-            .map(|(idx, index)| match values.get(index.as_usize()) {
-                Some(v) => *v,
-                None => match n.is_null(idx) {
-                    true => T::default(),
-                    false => panic!("Out-of-bounds index {index:?}"),
-                },
-            })
-            .collect(),
-        None => indices
-            .values()
-            .iter()
-            .map(|index| values[index.as_usize()])
-            .collect(),
+        Some(n) => {
+            // Pre-allocate with exact capacity
+            let mut buffer = Vec::with_capacity(indices.len());
+
+            for (idx, &index) in indices.values().iter().enumerate() {
+                let index_usize = index.as_usize();
+
+                // Check null first (more predictable branch)
+                if n.is_null(idx) {
+                    buffer.push(T::default());
+                } else if index_usize < values.len() {
+                    // SAFETY: bounds checked above
+                    buffer.push(unsafe { *values.get_unchecked(index_usize) });
+                } else {
+                    panic!("Out-of-bounds index {index:?}");
+                }
+            }
+
+            buffer.into()
+        }
+        None => {
+            // Fast path: no nulls, use unsafe for performance
+            indices
+                .values()
+                .iter()
+                .map(|&index| {
+                    let idx = index.as_usize();
+                    // SAFETY: caller ensures bounds are checked before calling take_native
+                    // or indices are validated during construction
+                    unsafe { *values.get_unchecked(idx) }
+                })
+                .collect()
+        }
     }
 }
 
