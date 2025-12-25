@@ -99,8 +99,8 @@ impl ParquetObjectReader {
         let file_size = object_meta.size;
         Self {
             store,
-            file_size: Some(file_size),
             object_meta,
+            file_size: Some(file_size),
             metadata_size_hint: None,
             preload_column_index: false,
             preload_offset_index: false,
