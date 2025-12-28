@@ -96,10 +96,11 @@ impl ParquetObjectReader {
     }
 
     pub fn new_with_meta(store: Arc<dyn ObjectStore>, object_meta: ObjectMeta) -> Self {
+        let file_size = object_meta.size;
         Self {
             store,
             object_meta,
-            file_size: None,
+            file_size: Some(file_size),
             metadata_size_hint: None,
             preload_column_index: false,
             preload_offset_index: false,
