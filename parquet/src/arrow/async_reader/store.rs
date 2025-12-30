@@ -90,12 +90,17 @@ impl ParquetObjectReader {
         Self::new_with_meta(store, object_meta)
     }
 
-    /// Provide the byte size of this file.
+    /// Provide the byte size of this file to use bounded range requests instead of suffix requests.
     ///
-    /// Deprecated: Use [`Self::new_with_meta`] with an [`ObjectMeta`] that includes the file size.
-    #[deprecated(
-        note = "use ParquetObjectReader::new_with_meta to provide ObjectMeta including size"
-    )]
+    /// This is required for storage systems that don't support suffix range requests,
+    /// such as Azure Blob Storage. For S3 and most other object stores, suffix requests
+    /// are more efficient and this method is not needed.
+    ///
+    /// When using [`Self::new_with_meta`], you can get the size from [`ObjectMeta::size`]:
+    /// ```ignore
+    /// let reader = ParquetObjectReader::new_with_meta(store, meta.clone())
+    ///     .with_file_size(meta.size as u64);
+    /// ```
     pub fn with_file_size(mut self, size: u64) -> Self {
         self.file_size = Some(size);
         self
@@ -103,9 +108,14 @@ impl ParquetObjectReader {
 
     /// Creates a new [`ParquetObjectReader`] for the provided [`ObjectStore`] and [`ObjectMeta`].
     ///
-    /// Using this constructor ensures the file size is known upfront, enabling bounded range
-    /// requests instead of suffix requests. This is important for storage systems that don't
-    /// support suffix range requests (e.g., Azure Blob Storage).
+    /// By default, this uses suffix range requests which are efficient for S3 and most object stores.
+    /// For storage systems that don't support suffix requests (e.g., Azure Blob Storage), chain with
+    /// [`Self::with_file_size`] to use bounded range requests:
+    ///
+    /// ```ignore
+    /// let reader = ParquetObjectReader::new_with_meta(store, meta.clone())
+    ///     .with_file_size(meta.size as u64);
+    /// ```
     pub fn new_with_meta(store: Arc<dyn ObjectStore>, object_meta: ObjectMeta) -> Self {
         Self {
             store,
