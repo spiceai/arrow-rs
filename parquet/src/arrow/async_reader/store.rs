@@ -220,13 +220,18 @@ impl ParquetObjectReader {
 
 impl MetadataSuffixFetch for &mut ParquetObjectReader {
     fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, Result<Bytes>> {
-        let mut options = GetOptions::default().with_range(Some(GetRange::Suffix(suffix as u64)));
+        let mut options = GetOptions {
+            range: Some(GetRange::Suffix(suffix as u64)),
+            ..Default::default()
+        };
 
         if let Some(object_versioning_type) = self.object_versioning_type.as_ref() {
-            options = match object_versioning_type {
-                ObjectVersionType::ETag => options.with_if_match(self.object_meta.e_tag.as_deref()),
+            match object_versioning_type {
+                ObjectVersionType::ETag => {
+                    options.if_match = self.object_meta.e_tag.clone();
+                }
                 ObjectVersionType::Version => {
-                    options.with_version(self.object_meta.version.as_deref())
+                    options.version = self.object_meta.version.clone();
                 }
             };
         }
@@ -246,10 +251,17 @@ impl AsyncFileReader for ParquetObjectReader {
         let object_versioning_type = Arc::clone(&self.object_versioning_type);
         self.spawn(move |store, meta| {
             if let Some(object_versioning_type) = object_versioning_type.as_ref() {
-                let opts = GetOptions::default().with_range(Some(range));
-                let opts = match object_versioning_type {
-                    ObjectVersionType::ETag => opts.with_if_match(meta.e_tag.as_deref()),
-                    ObjectVersionType::Version => opts.with_version(meta.version.as_deref()),
+                let mut opts = GetOptions {
+                    range: Some(GetRange::Bounded(range)),
+                    ..Default::default()
+                };
+                match object_versioning_type {
+                    ObjectVersionType::ETag => {
+                        opts.if_match = meta.e_tag.clone();
+                    }
+                    ObjectVersionType::Version => {
+                        opts.version = meta.version.clone();
+                    }
                 };
 
                 store
