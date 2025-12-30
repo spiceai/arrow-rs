@@ -65,6 +65,7 @@ pub enum ObjectVersionType {
 pub struct ParquetObjectReader {
     store: Arc<dyn ObjectStore>,
     object_meta: ObjectMeta,
+    file_size: Option<u64>,
     metadata_size_hint: Option<usize>,
     preload_column_index: bool,
     preload_offset_index: bool,
@@ -96,7 +97,7 @@ impl ParquetObjectReader {
         note = "use ParquetObjectReader::new_with_meta to provide ObjectMeta including size"
     )]
     pub fn with_file_size(mut self, size: u64) -> Self {
-        self.object_meta.size = size;
+        self.file_size = Some(size);
         self
     }
 
@@ -109,6 +110,7 @@ impl ParquetObjectReader {
         Self {
             store,
             object_meta,
+            file_size: None,
             metadata_size_hint: None,
             preload_column_index: false,
             preload_offset_index: false,
@@ -285,8 +287,11 @@ impl AsyncFileReader for ParquetObjectReader {
                 }
             }
 
-            let file_size = self.object_meta.size;
-            let metadata = metadata.load_and_finish(self, file_size).await?;
+            let metadata = if let Some(file_size) = self.file_size {
+                metadata.load_and_finish(self, file_size).await?
+            } else {
+                metadata.load_via_suffix_and_finish(self).await?
+            };
 
             Ok(Arc::new(metadata))
         })
