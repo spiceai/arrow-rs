@@ -25,7 +25,6 @@ use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use object_store::path::Path;
 use object_store::ObjectStore;
-use object_store::ObjectStoreExt;
 use object_store::{GetOptions, GetRange, ObjectMeta};
 use tokio::runtime::Handle;
 
@@ -258,7 +257,7 @@ impl AsyncFileReader for ParquetObjectReader {
                     .and_then(|resp| resp.bytes())
                     .boxed()
             } else {
-                Box::pin(store.get_range(&meta.location, range))
+                store.get_range(&meta.location, range)
             }
         })
     }
@@ -327,7 +326,7 @@ mod tests {
     use futures::FutureExt;
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
-    use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+    use object_store::{ObjectMeta, ObjectStore};
 
     async fn get_meta_store() -> (ObjectMeta, Arc<dyn ObjectStore>) {
         let res = parquet_test_data();

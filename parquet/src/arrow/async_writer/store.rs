@@ -22,7 +22,6 @@ use std::sync::Arc;
 use crate::arrow::async_writer::AsyncFileWriter;
 use crate::errors::{ParquetError, Result};
 use object_store::ObjectStore;
-use object_store::ObjectStoreExt;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
