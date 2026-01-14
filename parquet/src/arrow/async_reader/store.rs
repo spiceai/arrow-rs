@@ -76,7 +76,7 @@ pub struct ParquetObjectReader {
 impl ParquetObjectReader {
     /// Creates a new [`ParquetObjectReader`] for the provided [`ObjectStore`] and [`Path`].
     #[deprecated(
-        note = "use ParquetObjectReader::new_with_meta_with_meta to provide ObjectMeta including size"
+        note = "use ParquetObjectReader::new_with_meta to provide ObjectMeta including size"
     )]
     pub fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
         let object_meta = ObjectMeta {
