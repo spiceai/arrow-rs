@@ -23,9 +23,19 @@ use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
-use object_store::{GetOptions, GetRange};
-use object_store::{ObjectStore, path::Path};
+use object_store::path::Path;
+use object_store::{GetOptions, GetRange, ObjectMeta};
+use object_store::ObjectStore;
 use tokio::runtime::Handle;
+
+/// Indicates the type of object versioning to use when retrieving objects from the object store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectVersionType {
+    /// Uses the ETag property of the object to retrieve the specific object
+    ETag,
+    /// Uses the Version property of the object to retrieve the specific object
+    Version,
+}
 
 /// Reads Parquet files in object storage using [`ObjectStore`].
 ///
@@ -46,7 +56,7 @@ use tokio::runtime::Handle;
 /// println!("Found Blob with {}B at {}", meta.size, meta.location);
 ///
 /// // Show Parquet metadata
-/// let reader = ParquetObjectReader::new(storage_container, meta.location).with_file_size(meta.size);
+/// let reader = ParquetObjectReader::new_with_meta(storage_container, meta);
 /// let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
 /// print_parquet_metadata(&mut stdout(), builder.metadata());
 /// # }
@@ -54,25 +64,67 @@ use tokio::runtime::Handle;
 #[derive(Clone, Debug)]
 pub struct ParquetObjectReader {
     store: Arc<dyn ObjectStore>,
-    path: Path,
+    object_meta: ObjectMeta,
     file_size: Option<u64>,
     metadata_size_hint: Option<usize>,
     preload_column_index: bool,
     preload_offset_index: bool,
+    object_versioning_type: Arc<Option<ObjectVersionType>>,
     runtime: Option<Handle>,
 }
 
 impl ParquetObjectReader {
     /// Creates a new [`ParquetObjectReader`] for the provided [`ObjectStore`] and [`Path`].
+    #[deprecated(
+        note = "use ParquetObjectReader::new_with_meta to provide ObjectMeta including size"
+    )]
     pub fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
+        let object_meta = ObjectMeta {
+            location: path,
+            last_modified: Default::default(),
+            size: 0,
+            e_tag: None,
+            version: None,
+        };
+
+        Self::new_with_meta(store, object_meta)
+    }
+
+    /// Provide the byte size of this file.
+    ///
+    /// Providing this size up front is an important optimization to avoid extra calls when the
+    /// underlying store does not support suffix range requests.
+    pub fn with_file_size(mut self, size: u64) -> Self {
+        self.file_size = Some(size);
+        self
+    }
+
+    /// Creates a new [`ParquetObjectReader`] for the provided [`ObjectStore`] and [`ObjectMeta`].
+    ///
+    /// This constructor is preferred over [`Self::new`] as it uses the size from ObjectMeta
+    /// to avoid suffix range requests which are not supported by all object stores (e.g. Azure).
+    pub fn new_with_meta(store: Arc<dyn ObjectStore>, object_meta: ObjectMeta) -> Self {
+        let file_size = object_meta.size;
         Self {
             store,
-            path,
-            file_size: None,
+            object_meta,
+            file_size: Some(file_size),
             metadata_size_hint: None,
             preload_column_index: false,
             preload_offset_index: false,
             runtime: None,
+            object_versioning_type: Arc::new(None),
+        }
+    }
+
+    /// Set the object versioning type to use when retrieving objects from the object store.
+    pub fn with_object_versioning_type(
+        self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        Self {
+            object_versioning_type: Arc::new(object_versioning_type),
+            ..self
         }
     }
 
@@ -81,22 +133,6 @@ impl ParquetObjectReader {
     pub fn with_footer_size_hint(self, hint: usize) -> Self {
         Self {
             metadata_size_hint: Some(hint),
-            ..self
-        }
-    }
-
-    /// Provide the byte size of this file.
-    ///
-    /// If provided, the file size will ensure that only bounded range requests are used. If file
-    /// size is not provided, the reader will use suffix range requests to fetch the metadata.
-    ///
-    /// Providing this size up front is an important optimization to avoid extra calls when the
-    /// underlying store does not support suffix range requests.
-    ///
-    /// The file size can be obtained using [`ObjectStore::list`] or [`ObjectStore::head`].
-    pub fn with_file_size(self, file_size: u64) -> Self {
-        Self {
-            file_size: Some(file_size),
             ..self
         }
     }
@@ -142,7 +178,7 @@ impl ParquetObjectReader {
 
     fn spawn<F, O, E>(&self, f: F) -> BoxFuture<'_, Result<O>>
     where
-        F: for<'a> FnOnce(&'a Arc<dyn ObjectStore>, &'a Path) -> BoxFuture<'a, Result<O, E>>
+        F: for<'a> FnOnce(&'a Arc<dyn ObjectStore>, &'a ObjectMeta) -> BoxFuture<'a, Result<O, E>>
             + Send
             + 'static,
         O: Send + 'static,
@@ -150,10 +186,10 @@ impl ParquetObjectReader {
     {
         match &self.runtime {
             Some(handle) => {
-                let path = self.path.clone();
+                let object_meta = self.object_meta.clone();
                 let store = Arc::clone(&self.store);
                 handle
-                    .spawn(async move { f(&store, &path).await })
+                    .spawn(async move { f(&store, &object_meta).await })
                     .map_ok_or_else(
                         |e| match e.try_into_panic() {
                             Err(e) => Err(ParquetError::External(Box::new(e))),
@@ -163,20 +199,30 @@ impl ParquetObjectReader {
                     )
                     .boxed()
             }
-            None => f(&self.store, &self.path).map_err(|e| e.into()).boxed(),
+            None => f(&self.store, &self.object_meta)
+                .map_err(|e| e.into())
+                .boxed(),
         }
     }
 }
 
 impl MetadataSuffixFetch for &mut ParquetObjectReader {
     fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, Result<Bytes>> {
+        let (if_match, version) = match self.object_versioning_type.as_ref().as_ref() {
+            Some(ObjectVersionType::ETag) => (self.object_meta.e_tag.clone(), None),
+            Some(ObjectVersionType::Version) => (None, self.object_meta.version.clone()),
+            None => (None, None),
+        };
         let options = GetOptions {
             range: Some(GetRange::Suffix(suffix as u64)),
+            if_match,
+            version,
             ..Default::default()
         };
-        self.spawn(|store, path| {
+
+        self.spawn(|store, meta| {
             async move {
-                let resp = store.get_opts(path, options).await?;
+                let resp = store.get_opts(&meta.location, options).await?;
                 Ok::<_, ParquetError>(resp.bytes().await?)
             }
             .boxed()
@@ -186,14 +232,28 @@ impl MetadataSuffixFetch for &mut ParquetObjectReader {
 
 impl AsyncFileReader for ParquetObjectReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
-        self.spawn(|store, path| store.get_range(path, range))
-    }
+        let object_versioning_type = Arc::clone(&self.object_versioning_type);
+        self.spawn(move |store, meta| {
+            if let Some(object_versioning_type) = object_versioning_type.as_ref() {
+                let (if_match, version) = match object_versioning_type {
+                    ObjectVersionType::ETag => (meta.e_tag.clone(), None),
+                    ObjectVersionType::Version => (None, meta.version.clone()),
+                };
+                let opts = GetOptions {
+                    range: Some(GetRange::Bounded(range)),
+                    if_match,
+                    version,
+                    ..Default::default()
+                };
 
-    fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>>
-    where
-        Self: Send,
-    {
-        self.spawn(|store, path| async move { store.get_ranges(path, &ranges).await }.boxed())
+                store
+                    .get_opts(&meta.location, opts)
+                    .and_then(|resp| resp.bytes())
+                    .boxed()
+            } else {
+                store.get_range(&meta.location, range)
+            }
+        })
     }
 
     // This method doesn't directly call `self.spawn` because all of the IO that is done down the
@@ -208,6 +268,7 @@ impl AsyncFileReader for ParquetObjectReader {
     ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
         Box::pin(async move {
             let metadata_opts = options.map(|o| o.metadata_options().clone());
+            #[allow(unused_mut)] // mut is used in the feature
             let mut metadata = ParquetMetaDataReader::new()
                 .with_metadata_options(metadata_opts)
                 .with_column_index_policy(PageIndexPolicy::from(self.preload_column_index))
@@ -289,8 +350,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple() {
         let (meta, store) = get_meta_store().await;
-        let object_reader =
-            ParquetObjectReader::new(store, meta.location).with_file_size(meta.size);
+        let object_reader = ParquetObjectReader::new_with_meta(store, meta);
 
         let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
             .await
@@ -304,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple_without_file_length() {
         let (meta, store) = get_meta_store().await;
-        let object_reader = ParquetObjectReader::new(store, meta.location);
+        let object_reader = ParquetObjectReader::new_with_meta(store, meta);
 
         let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
             .await
@@ -320,8 +380,7 @@ mod tests {
         let (mut meta, store) = get_meta_store().await;
         meta.location = Path::from("I don't exist.parquet");
 
-        let object_reader =
-            ParquetObjectReader::new(store, meta.location).with_file_size(meta.size);
+        let object_reader = ParquetObjectReader::new_with_meta(store, meta);
         // Cannot use unwrap_err as ParquetRecordBatchStreamBuilder: !Debug
         match ParquetRecordBatchStreamBuilder::new(object_reader).await {
             Ok(_) => panic!("expected failure"),
@@ -351,9 +410,8 @@ mod tests {
 
         let initial_actions = num_actions.load(Ordering::Relaxed);
 
-        let reader = ParquetObjectReader::new(store, meta.location)
-            .with_file_size(meta.size)
-            .with_runtime(rt.handle().clone());
+        let reader =
+            ParquetObjectReader::new_with_meta(store, meta).with_runtime(rt.handle().clone());
 
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
         let batches: Vec<_> = builder.build().unwrap().try_collect().await.unwrap();
@@ -379,9 +437,8 @@ mod tests {
 
         let (meta, store) = get_meta_store().await;
 
-        let reader = ParquetObjectReader::new(store, meta.location)
-            .with_file_size(meta.size)
-            .with_runtime(rt.handle().clone());
+        let reader =
+            ParquetObjectReader::new_with_meta(store, meta).with_runtime(rt.handle().clone());
 
         let current_id = std::thread::current().id();
 
@@ -404,9 +461,8 @@ mod tests {
 
         let (meta, store) = get_meta_store().await;
 
-        let mut reader = ParquetObjectReader::new(store, meta.location)
-            .with_file_size(meta.size)
-            .with_runtime(rt.handle().clone());
+        let mut reader =
+            ParquetObjectReader::new_with_meta(store, meta).with_runtime(rt.handle().clone());
 
         rt.shutdown_background();
 
