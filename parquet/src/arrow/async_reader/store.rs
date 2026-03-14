@@ -23,9 +23,9 @@ use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
+use object_store::ObjectStore;
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectMeta};
-use object_store::ObjectStore;
 use tokio::runtime::Handle;
 
 /// Indicates the type of object versioning to use when retrieving objects from the object store.
