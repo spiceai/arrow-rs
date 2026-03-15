@@ -476,8 +476,7 @@ mod tests {
         let (meta, store) = get_meta_store_with_page_index().await;
 
         // Create reader with preload flags set to true
-        let mut reader = ParquetObjectReader::new(store.clone(), meta.location.clone())
-            .with_file_size(meta.size)
+        let mut reader = ParquetObjectReader::new_with_meta(store.clone(), meta.clone())
             .with_preload_column_index(true)
             .with_preload_offset_index(true);
 
@@ -497,8 +496,7 @@ mod tests {
         let (meta, store) = get_meta_store_with_page_index().await;
 
         // Create reader with preload flags set to false
-        let mut reader = ParquetObjectReader::new(store.clone(), meta.location.clone())
-            .with_file_size(meta.size)
+        let mut reader = ParquetObjectReader::new_with_meta(store.clone(), meta.clone())
             .with_preload_column_index(false)
             .with_preload_offset_index(false);
 
@@ -519,8 +517,7 @@ mod tests {
         let (meta, store) = get_meta_store_with_page_index().await;
 
         // Test 1: preload=false + Skip policy -> uses preload flags (false)
-        let mut reader1 = ParquetObjectReader::new(store.clone(), meta.location.clone())
-            .with_file_size(meta.size)
+        let mut reader1 = ParquetObjectReader::new_with_meta(store.clone(), meta.clone())
             .with_preload_column_index(false)
             .with_preload_offset_index(false);
 
@@ -529,8 +526,7 @@ mod tests {
         let metadata1 = reader1.get_metadata(Some(&options1)).await.unwrap();
 
         // Test 2: preload=false + Optional policy -> overrides to try loading
-        let mut reader2 = ParquetObjectReader::new(store.clone(), meta.location.clone())
-            .with_file_size(meta.size)
+        let mut reader2 = ParquetObjectReader::new_with_meta(store.clone(), meta.clone())
             .with_preload_column_index(false)
             .with_preload_offset_index(false);
 
@@ -550,8 +546,7 @@ mod tests {
         let (meta, store) = get_meta_store_with_page_index().await;
 
         // Create reader with preload flags set to true
-        let mut reader = ParquetObjectReader::new(store, meta.location)
-            .with_file_size(meta.size)
+        let mut reader = ParquetObjectReader::new_with_meta(store, meta)
             .with_preload_column_index(true)
             .with_preload_offset_index(true);
 
