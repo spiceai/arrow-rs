@@ -462,7 +462,8 @@ impl From<FixedSizeListArray> for ArrayData {
     }
 }
 
-impl Array for FixedSizeListArray {
+/// SAFETY: Correctly implements the contract of Arrow Arrays
+unsafe impl Array for FixedSizeListArray {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -836,5 +837,12 @@ mod tests {
             err.to_string(),
             "Invalid argument error: An degenerate FixedSizeListArray should have no underlying values, found 3 values"
         );
+    }
+
+    #[test]
+    fn test_fixed_size_list_new_null_len() {
+        let field = Arc::new(Field::new_list_field(DataType::Int32, true));
+        let array = FixedSizeListArray::new_null(field, 2, 5);
+        assert_eq!(array.len(), 5);
     }
 }
