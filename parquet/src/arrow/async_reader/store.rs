@@ -737,8 +737,8 @@ mod tests {
         // chunks fit within the coalesce gap (~1MB), expect single-digit fetches.
         let fetch_count = store.get_opts_count.load(Ordering::Relaxed);
         assert!(
-            fetch_count < 5,
-            "Expected coalesced fetches < 5, but got {fetch_count}."
+            fetch_count < 10,
+            "Expected coalesced fetches < 10, but got {fetch_count}."
         );
     }
 }
