@@ -23,9 +23,9 @@ use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
+use object_store::ObjectStore;
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectMeta};
-use object_store::ObjectStore;
 use tokio::runtime::Handle;
 
 /// Indicates the type of object versioning to use when retrieving objects from the object store.
@@ -256,6 +256,41 @@ impl AsyncFileReader for ParquetObjectReader {
         })
     }
 
+    fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>> {
+        let object_versioning_type = Arc::clone(&self.object_versioning_type);
+        self.spawn(move |store, meta| {
+            async move {
+                // Replicates the behavior of ObjectStore::get_ranges() which internally
+                // calls coalesce_ranges() with get_range(), but uses get_opts() to support
+                // versioned reads (ETag/Version pinning) when configured.
+                // See: https://github.com/apache/arrow-rs-object-store/blob/v0.12.0/src/lib.rs#L640
+                // (ObjectStore::get_ranges default impl)
+                let (if_match, version) = match object_versioning_type.as_ref() {
+                    Some(ObjectVersionType::ETag) => (meta.e_tag.clone(), None),
+                    Some(ObjectVersionType::Version) => (None, meta.version.clone()),
+                    None => (None, None),
+                };
+                let location = &meta.location;
+                object_store::coalesce_ranges(
+                    &ranges,
+                    |range| {
+                        let opts = GetOptions {
+                            range: Some(GetRange::Bounded(range)),
+                            if_match: if_match.clone(),
+                            version: version.clone(),
+                            ..Default::default()
+                        };
+                        async { store.get_opts(location, opts).await?.bytes().await }
+                    },
+                    object_store::OBJECT_STORE_COALESCE_DEFAULT,
+                )
+                .await
+                .map_err(|e| ParquetError::External(Box::new(e)))
+            }
+            .boxed()
+        })
+    }
+
     // This method doesn't directly call `self.spawn` because all of the IO that is done down the
     // line due to this method call is done through `self.get_bytes` and/or `self.get_byte_ranges`.
     // When `self` is passed into `ParquetMetaDataReader::load_and_finish`, it treats it as
@@ -312,7 +347,17 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use futures::TryStreamExt;
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions, PutOptions,
+        PutPayload, PutResult,
+    };
+    use std::fmt::{self, Display, Formatter};
 
     use crate::arrow::ParquetRecordBatchStreamBuilder;
     use crate::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
@@ -345,6 +390,74 @@ mod tests {
             .unwrap();
 
         (meta, Arc::new(store) as Arc<dyn ObjectStore>)
+    }
+
+    /// An `ObjectStore` wrapper that counts `get_opts` calls.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemory,
+        get_opts_count: AtomicUsize,
+    }
+
+    impl Display for CountingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.get_opts_count.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
     }
 
     #[tokio::test]
@@ -562,5 +675,70 @@ mod tests {
         // and converted to Optional policy internally (preload=true -> Optional)
         // The test file has page indexes, so they will be some
         assert!(metadata.column_index().is_some() && metadata.column_index().is_some());
+    }
+
+    /// End-to-end test that reading a multi-column parquet file through
+    /// `ParquetObjectReader` coalesces column chunk fetches into batched
+    /// requests, rather than issuing one HTTP request per column chunk.
+    #[tokio::test]
+    async fn test_get_byte_ranges_coalesces_fetches() {
+        const NUM_COLUMNS: usize = 50;
+
+        // -- Write a parquet file (NUM_COLUMNS columns) into memory --
+        let fields: Vec<Field> = (0..NUM_COLUMNS)
+            .map(|i| Field::new(format!("col_{i}"), DataType::Int32, false))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = (0..NUM_COLUMNS)
+            .map(|i| Arc::new(Int32Array::from(vec![i as i32; 100])) as _)
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).expect("valid batch");
+
+        let mut buf = Vec::new();
+        let mut writer =
+            crate::arrow::ArrowWriter::try_new(&mut buf, schema, None).expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close");
+
+        let location = Path::from("test_coalesced_ranges.parquet");
+        let store = Arc::new(CountingStore {
+            inner: InMemory::new(),
+            get_opts_count: AtomicUsize::new(0),
+        });
+
+        store
+            .put(&location, PutPayload::from(buf))
+            .await
+            .expect("put");
+        let meta = store.head(&location).await.expect("head");
+
+        // Reset counter after setup (head calls get_opts internally)
+        store.get_opts_count.store(0, Ordering::Relaxed);
+
+        // -- Read all data through ParquetObjectReader --
+        let reader = ParquetObjectReader::new_with_meta(store.clone(), meta);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .expect("builder");
+        let batches: Vec<_> = builder
+            .build()
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 100);
+        assert_eq!(batches[0].num_columns(), NUM_COLUMNS);
+
+        // With coalesced get_byte_ranges working correctly, the store should receive far fewer
+        // get_opts calls than NUM_COLUMNS. For a small file where all column
+        // chunks fit within the coalesce gap (~1MB), expect single-digit fetches.
+        let fetch_count = store.get_opts_count.load(Ordering::Relaxed);
+        assert!(
+            fetch_count < 5,
+            "Expected coalesced fetches < 5, but got {fetch_count}."
+        );
     }
 }
