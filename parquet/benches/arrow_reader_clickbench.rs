@@ -744,6 +744,9 @@ impl ReadTest {
         let store = Arc::new(LocalFileSystem::new_with_prefix(parent).unwrap());
         let location = object_store::path::Path::from(file_name);
 
+        // `new` is deprecated by the Spice ParquetObjectReader patch in favor of
+        // `new_with_meta`, but this benchmark only has a path (no `ObjectMeta`).
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(store, location);
 
         // setup the reader
