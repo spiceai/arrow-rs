@@ -21,7 +21,7 @@ use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{CacheOptionsBuilder, RowGroupCache};
 use crate::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 /// State machine for evaluating a sequence of predicates.
 ///
@@ -51,13 +51,13 @@ pub(super) struct CacheInfo {
     /// Normally these are the columns that filters may look at such that
     /// if we have a filter like `(a + 10 > 5) AND (a + b = 0)` we cache `a` to avoid re-reading it between evaluating `a + 10 > 5` and `a + b = 0`.
     cache_projection: ProjectionMask,
-    row_group_cache: Arc<Mutex<RowGroupCache>>,
+    row_group_cache: Arc<RwLock<RowGroupCache>>,
 }
 
 impl CacheInfo {
     pub(super) fn new(
         cache_projection: ProjectionMask,
-        row_group_cache: Arc<Mutex<RowGroupCache>>,
+        row_group_cache: Arc<RwLock<RowGroupCache>>,
     ) -> Self {
         Self {
             cache_projection,
@@ -124,6 +124,13 @@ impl FilterInfo {
             // advance ensures next_predicate is always in bounds
             .unwrap()
             .as_ref()
+    }
+
+    /// Returns `true` if the current predicate is the last one in the chain
+    /// (i.e. the next call to [`Self::advance`] will return
+    /// [`AdvanceResult::Done`]).
+    pub(super) fn is_last(&self) -> bool {
+        self.next_predicate.get() == self.filter.predicates.len()
     }
 
     /// Return a reference to the cache projection

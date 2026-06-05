@@ -24,6 +24,7 @@ use crate::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataRea
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectMeta};
 use tokio::runtime::Handle;
@@ -251,7 +252,7 @@ impl AsyncFileReader for ParquetObjectReader {
                     .and_then(|resp| resp.bytes())
                     .boxed()
             } else {
-                store.get_range(&meta.location, range)
+                store.get_range(&meta.location, range).boxed()
             }
         })
     }
@@ -318,12 +319,15 @@ impl AsyncFileReader for ParquetObjectReader {
             }
 
             // Override page index policies from ArrowReaderOptions if specified and not Skip.
-            // When page_index_policy is Skip (default), use the reader's preload flags.
-            // When page_index_policy is Optional or Required, override the preload flags
-            // to ensure the specified policy takes precedence.
+            // Upstream split the single page-index policy into independent column-index and
+            // offset-index policies; honor each so a caller-specified policy takes precedence
+            // over the reader's preload flags. Skip (the default) leaves the preload flags intact.
             if let Some(options) = options {
-                if options.page_index_policy != PageIndexPolicy::Skip {
-                    metadata = metadata.with_page_index_policy(options.page_index_policy);
+                if options.column_index_policy() != PageIndexPolicy::Skip {
+                    metadata = metadata.with_column_index_policy(options.column_index_policy());
+                }
+                if options.offset_index_policy() != PageIndexPolicy::Skip {
+                    metadata = metadata.with_offset_index_policy(options.offset_index_policy());
                 }
             }
 

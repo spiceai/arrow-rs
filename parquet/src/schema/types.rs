@@ -398,7 +398,7 @@ impl<'a> PrimitiveTypeBuilder<'a> {
                 (LogicalType::Integer { bit_width, .. }, PhysicalType::INT64)
                     if *bit_width == 64 => {}
                 // Null type
-                (LogicalType::Unknown, PhysicalType::INT32) => {}
+                (LogicalType::Unknown, _) => {}
                 (LogicalType::String, PhysicalType::BYTE_ARRAY) => {}
                 (LogicalType::Json, PhysicalType::BYTE_ARRAY) => {}
                 (LogicalType::Bson, PhysicalType::BYTE_ARRAY) => {}
@@ -853,6 +853,9 @@ pub struct ColumnDescriptor {
     /// The maximum repetition level for this column
     max_rep_level: i16,
 
+    /// The definition level at the nearest REPEATED ancestor, or 0 if none.
+    repeated_ancestor_def_level: i16,
+
     /// The path of this column. For instance, "a.b.c.d".
     path: ColumnPath,
 }
@@ -873,10 +876,21 @@ impl ColumnDescriptor {
         max_rep_level: i16,
         path: ColumnPath,
     ) -> Self {
+        Self::new_with_repeated_ancestor(primitive_type, max_def_level, max_rep_level, path, 0)
+    }
+
+    pub(crate) fn new_with_repeated_ancestor(
+        primitive_type: TypePtr,
+        max_def_level: i16,
+        max_rep_level: i16,
+        path: ColumnPath,
+        repeated_ancestor_def_level: i16,
+    ) -> Self {
         Self {
             primitive_type,
             max_def_level,
             max_rep_level,
+            repeated_ancestor_def_level,
             path,
         }
     }
@@ -891,6 +905,12 @@ impl ColumnDescriptor {
     #[inline]
     pub fn max_rep_level(&self) -> i16 {
         self.max_rep_level
+    }
+
+    /// Returns the definition level at the nearest REPEATED ancestor, or 0 if none.
+    #[inline]
+    pub fn repeated_ancestor_def_level(&self) -> i16 {
+        self.repeated_ancestor_def_level
     }
 
     /// Returns [`ColumnPath`] for this column.
@@ -1069,7 +1089,16 @@ impl SchemaDescriptor {
         let mut path = Vec::with_capacity(INIT_SCHEMA_DEPTH);
         for (root_idx, f) in tp.get_fields().iter().enumerate() {
             path.clear();
-            build_tree(f, root_idx, 0, 0, &mut leaves, &mut leaf_to_base, &mut path);
+            build_tree(
+                f,
+                root_idx,
+                0,
+                0,
+                0,
+                &mut leaves,
+                &mut leaf_to_base,
+                &mut path,
+            );
         }
 
         Self {
@@ -1191,11 +1220,13 @@ fn count_leaves(tp: &TypePtr, n_leaves: &mut usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_tree<'a>(
     tp: &'a TypePtr,
     root_idx: usize,
     mut max_rep_level: i16,
     mut max_def_level: i16,
+    mut repeated_ancestor_def_level: i16,
     leaves: &mut Vec<ColumnDescPtr>,
     leaf_to_base: &mut Vec<usize>,
     path_so_far: &mut Vec<&'a str>,
@@ -1210,6 +1241,7 @@ fn build_tree<'a>(
         Repetition::REPEATED => {
             max_def_level += 1;
             max_rep_level += 1;
+            repeated_ancestor_def_level = max_def_level;
         }
         _ => {}
     }
@@ -1218,12 +1250,14 @@ fn build_tree<'a>(
         Type::PrimitiveType { .. } => {
             let mut path: Vec<String> = vec![];
             path.extend(path_so_far.iter().copied().map(String::from));
-            leaves.push(Arc::new(ColumnDescriptor::new(
+            let desc = ColumnDescriptor::new_with_repeated_ancestor(
                 tp.clone(),
                 max_def_level,
                 max_rep_level,
                 ColumnPath::new(path),
-            )));
+                repeated_ancestor_def_level,
+            );
+            leaves.push(Arc::new(desc));
             leaf_to_base.push(root_idx);
         }
         Type::GroupType { fields, .. } => {
@@ -1233,6 +1267,7 @@ fn build_tree<'a>(
                     root_idx,
                     max_rep_level,
                     max_def_level,
+                    repeated_ancestor_def_level,
                     leaves,
                     leaf_to_base,
                     path_so_far,
@@ -1366,7 +1401,7 @@ fn schema_from_array_helper<'a>(
         Some(n) => {
             let repetition = element.repetition_type;
 
-            let mut fields = Vec::with_capacity(n as usize);
+            let mut fields = Vec::with_capacity(usize::try_from(n)?);
             let mut next_index = index + 1;
             for _ in 0..n {
                 let child_result = schema_from_array_helper(elements, num_elements, next_index)?;
@@ -1942,6 +1977,122 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_build_tree_repeated_ancestor_def_level() {
+        // Flat columns: no REPEATED ancestor → repeated_ancestor_def_level = 0
+        let message_type = "
+    message m {
+      REQUIRED INT32 a;
+      OPTIONAL INT32 b;
+      OPTIONAL group s {
+        OPTIONAL INT32 x;
+      }
+    }
+    ";
+        let schema = parse_message_type(message_type).expect("should parse schema");
+        let descr = SchemaDescriptor::new(Arc::new(schema));
+        assert_eq!(descr.column(0).repeated_ancestor_def_level(), 0); // a
+        assert_eq!(descr.column(1).repeated_ancestor_def_level(), 0); // b
+        assert_eq!(descr.column(2).repeated_ancestor_def_level(), 0); // s.x
+
+        // Standard list: OPTIONAL outer, REPEATED group, OPTIONAL element
+        // repeated_ancestor_def_level is the def_level at the REPEATED group (= 2)
+        let message_type = "
+    message m {
+      OPTIONAL group c (LIST) {
+        REPEATED group list {
+          OPTIONAL INT32 element;
+        }
+      }
+    }
+    ";
+        let schema = parse_message_type(message_type).expect("should parse schema");
+        let descr = SchemaDescriptor::new(Arc::new(schema));
+        // c(optional)=1, list(repeated)=2, element(optional)=3
+        assert_eq!(descr.column(0).max_def_level(), 3);
+        assert_eq!(descr.column(0).max_rep_level(), 1);
+        assert_eq!(descr.column(0).repeated_ancestor_def_level(), 2);
+
+        // Required list: REQUIRED outer, REPEATED group, REQUIRED element
+        // No OPTIONAL nodes between REPEATED and leaf, so repeated_ancestor_def_level == max_def_level
+        let message_type = "
+    message m {
+      REQUIRED group c (LIST) {
+        REPEATED group list {
+          REQUIRED INT32 element;
+        }
+      }
+    }
+    ";
+        let schema = parse_message_type(message_type).expect("should parse schema");
+        let descr = SchemaDescriptor::new(Arc::new(schema));
+        // list(repeated)=1, element(required)=1
+        assert_eq!(descr.column(0).max_def_level(), 1);
+        assert_eq!(descr.column(0).max_rep_level(), 1);
+        assert_eq!(descr.column(0).repeated_ancestor_def_level(), 1);
+
+        // Nested lists: innermost REPEATED wins
+        let message_type = "
+    message m {
+      OPTIONAL group outer (LIST) {
+        REPEATED group list {
+          OPTIONAL group inner (LIST) {
+            REPEATED group list2 {
+              OPTIONAL INT32 element;
+            }
+          }
+        }
+      }
+    }
+    ";
+        let schema = parse_message_type(message_type).expect("should parse schema");
+        let descr = SchemaDescriptor::new(Arc::new(schema));
+        // outer(opt)=1, list(rep)=2, inner(opt)=3, list2(rep)=4, element(opt)=5
+        assert_eq!(descr.column(0).max_def_level(), 5);
+        assert_eq!(descr.column(0).max_rep_level(), 2);
+        assert_eq!(descr.column(0).repeated_ancestor_def_level(), 4);
+
+        // Struct inside list: all sibling leaves share the same repeated_ancestor_def_level
+        let message_type = "
+    message m {
+      OPTIONAL group bag (LIST) {
+        REPEATED group list {
+          REQUIRED group item {
+            OPTIONAL INT32 x;
+            REQUIRED INT32 y;
+          }
+        }
+      }
+    }
+    ";
+        let schema = parse_message_type(message_type).expect("should parse schema");
+        let descr = SchemaDescriptor::new(Arc::new(schema));
+        // bag(opt)=1, list(rep)=2, item(req)=2, x(opt)=3
+        assert_eq!(descr.column(0).repeated_ancestor_def_level(), 2); // bag.list.item.x
+        // bag(opt)=1, list(rep)=2, item(req)=2, y(req)=2
+        assert_eq!(descr.column(1).repeated_ancestor_def_level(), 2); // bag.list.item.y
+
+        // Map type: key (required) and value (optional) under the same REPEATED group
+        let message_type = "
+    message m {
+      OPTIONAL group my_map (MAP) {
+        REPEATED group key_value {
+          REQUIRED BYTE_ARRAY key (UTF8);
+          OPTIONAL INT32 value;
+        }
+      }
+    }
+    ";
+        let schema = parse_message_type(message_type).expect("should parse schema");
+        let descr = SchemaDescriptor::new(Arc::new(schema));
+        // my_map(opt)=1, key_value(rep)=2, key(req)=2
+        assert_eq!(descr.column(0).max_def_level(), 2);
+        assert_eq!(descr.column(0).repeated_ancestor_def_level(), 2); // key: max_def == repeated_ancestor
+        // my_map(opt)=1, key_value(rep)=2, value(opt)=3
+        assert_eq!(descr.column(1).max_def_level(), 3);
+        assert_eq!(descr.column(1).repeated_ancestor_def_level(), 2); // value: max_def > repeated_ancestor
+    }
+
+    #[test]
     #[should_panic(expected = "Cannot call get_physical_type() on a non-primitive type")]
     fn test_get_physical_type_panic() {
         let list = Type::group_type_builder("records")
@@ -2365,5 +2516,23 @@ mod tests {
 
         let result_schema = parquet_schema_from_array(thrift_schema).unwrap();
         assert_eq!(result_schema, expected_schema);
+    }
+
+    #[test]
+    fn test_parquet_schema_from_array_rejects_negative_num_children() {
+        let elements = vec![SchemaElement {
+            r#type: None,
+            type_length: None,
+            repetition_type: Some(Repetition::REQUIRED),
+            name: "schema",
+            num_children: Some(-1),
+            converted_type: None,
+            scale: None,
+            precision: None,
+            field_id: None,
+            logical_type: None,
+        }];
+        let result = parquet_schema_from_array(elements);
+        assert!(result.unwrap_err().to_string().contains("Integer overflow"));
     }
 }

@@ -16,25 +16,27 @@
 // under the License.
 
 use crate::shred_variant::{
-    VariantToShreddedVariantRowBuilder, make_variant_to_shredded_variant_arrow_row_builder,
+    NullValue, VariantToShreddedVariantRowBuilder,
+    make_variant_to_shredded_variant_arrow_row_builder,
 };
 use crate::type_conversion::{
-    PrimitiveFromVariant, TimestampFromVariant, variant_to_unscaled_decimal,
+    PrimitiveFromVariant, TimestampFromVariant, variant_cast_with_options,
+    variant_to_unscaled_decimal,
 };
 use crate::variant_array::ShreddedVariantFieldArray;
 use crate::{VariantArray, VariantValueArrayBuilder};
 use arrow::array::{
-    ArrayRef, ArrowNativeTypeOp, BinaryBuilder, BinaryLikeArrayBuilder, BinaryViewArray,
-    BinaryViewBuilder, BooleanBuilder, FixedSizeBinaryBuilder, GenericListArray,
-    GenericListViewArray, LargeBinaryBuilder, LargeStringBuilder, NullArray, NullBufferBuilder,
-    OffsetSizeTrait, PrimitiveBuilder, StringBuilder, StringLikeArrayBuilder, StringViewBuilder,
+    ArrayRef, ArrowNativeTypeOp, BinaryBuilder, BinaryLikeArrayBuilder, BinaryViewBuilder,
+    BooleanBuilder, FixedSizeBinaryBuilder, GenericListArray, GenericListViewArray,
+    LargeBinaryBuilder, LargeStringBuilder, NullArray, NullBufferBuilder, OffsetSizeTrait,
+    PrimitiveBuilder, StringBuilder, StringLikeArrayBuilder, StringViewBuilder, StructArray,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::{CastOptions, DecimalCast};
 use arrow::datatypes::{self, DataType, DecimalType};
 use arrow::error::{ArrowError, Result};
-use arrow_schema::{FieldRef, TimeUnit};
-use parquet_variant::{Variant, VariantList, VariantPath};
+use arrow_schema::{FieldRef, Fields, TimeUnit};
+use parquet_variant::{Variant, VariantPath};
 use std::sync::Arc;
 
 /// Builder for converting variant values into strongly typed Arrow arrays.
@@ -43,6 +45,8 @@ use std::sync::Arc;
 /// with casting of leaf values to specific types.
 pub(crate) enum VariantToArrowRowBuilder<'a> {
     Primitive(PrimitiveVariantToArrowRowBuilder<'a>),
+    Array(ArrayVariantToArrowRowBuilder<'a>),
+    Struct(StructVariantToArrowRowBuilder<'a>),
     BinaryVariant(VariantToBinaryVariantArrowRowBuilder),
 
     // Path extraction wrapper - contains a boxed enum for any of the above
@@ -54,6 +58,8 @@ impl<'a> VariantToArrowRowBuilder<'a> {
         use VariantToArrowRowBuilder::*;
         match self {
             Primitive(b) => b.append_null(),
+            Array(b) => b.append_null(),
+            Struct(b) => b.append_null(),
             BinaryVariant(b) => b.append_null(),
             WithPath(path_builder) => path_builder.append_null(),
         }
@@ -63,6 +69,8 @@ impl<'a> VariantToArrowRowBuilder<'a> {
         use VariantToArrowRowBuilder::*;
         match self {
             Primitive(b) => b.append_value(&value),
+            Array(b) => b.append_value(&value),
+            Struct(b) => b.append_value(&value),
             BinaryVariant(b) => b.append_value(value),
             WithPath(path_builder) => path_builder.append_value(value),
         }
@@ -72,14 +80,45 @@ impl<'a> VariantToArrowRowBuilder<'a> {
         use VariantToArrowRowBuilder::*;
         match self {
             Primitive(b) => b.finish(),
+            Array(b) => b.finish(),
+            Struct(b) => b.finish(),
             BinaryVariant(b) => b.finish(),
             WithPath(path_builder) => path_builder.finish(),
         }
     }
 }
 
+fn make_typed_variant_to_arrow_row_builder<'a>(
+    data_type: &'a DataType,
+    cast_options: &'a CastOptions,
+    capacity: usize,
+) -> Result<VariantToArrowRowBuilder<'a>> {
+    use VariantToArrowRowBuilder::*;
+
+    match data_type {
+        DataType::Struct(fields) => {
+            let builder = StructVariantToArrowRowBuilder::try_new(fields, cast_options, capacity)?;
+            Ok(Struct(builder))
+        }
+        data_type @ (DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::FixedSizeList(..)) => {
+            let builder =
+                ArrayVariantToArrowRowBuilder::try_new(data_type, cast_options, capacity, false)?;
+            Ok(Array(builder))
+        }
+        data_type => {
+            let builder =
+                make_primitive_variant_to_arrow_row_builder(data_type, cast_options, capacity)?;
+            Ok(Primitive(builder))
+        }
+    }
+}
+
 pub(crate) fn make_variant_to_arrow_row_builder<'a>(
-    metadata: &BinaryViewArray,
+    metadata: &ArrayRef,
     path: VariantPath<'a>,
     data_type: Option<&'a DataType>,
     cast_options: &'a CastOptions,
@@ -93,26 +132,8 @@ pub(crate) fn make_variant_to_arrow_row_builder<'a>(
             metadata.clone(),
             capacity,
         )),
-        Some(DataType::Struct(_)) => {
-            return Err(ArrowError::NotYetImplemented(
-                "Converting unshredded variant objects to arrow structs".to_string(),
-            ));
-        }
-        Some(
-            DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::ListView(_)
-            | DataType::LargeListView(_)
-            | DataType::FixedSizeList(..),
-        ) => {
-            return Err(ArrowError::NotYetImplemented(
-                "Converting unshredded variant arrays to arrow lists".to_string(),
-            ));
-        }
         Some(data_type) => {
-            let builder =
-                make_primitive_variant_to_arrow_row_builder(data_type, cast_options, capacity)?;
-            Primitive(builder)
+            make_typed_variant_to_arrow_row_builder(data_type, cast_options, capacity)?
         }
     };
 
@@ -487,11 +508,95 @@ pub(crate) enum ArrayVariantToArrowRowBuilder<'a> {
     LargeListView(VariantToListArrowRowBuilder<'a, i64, true>),
 }
 
+pub(crate) struct StructVariantToArrowRowBuilder<'a> {
+    fields: &'a Fields,
+    field_builders: Vec<VariantToArrowRowBuilder<'a>>,
+    nulls: NullBufferBuilder,
+    cast_options: &'a CastOptions<'a>,
+}
+
+impl<'a> StructVariantToArrowRowBuilder<'a> {
+    fn try_new(
+        fields: &'a Fields,
+        cast_options: &'a CastOptions<'a>,
+        capacity: usize,
+    ) -> Result<Self> {
+        let mut field_builders = Vec::with_capacity(fields.len());
+        for field in fields.iter() {
+            field_builders.push(make_typed_variant_to_arrow_row_builder(
+                field.data_type(),
+                cast_options,
+                capacity,
+            )?);
+        }
+        Ok(Self {
+            fields,
+            field_builders,
+            nulls: NullBufferBuilder::new(capacity),
+            cast_options,
+        })
+    }
+
+    fn append_null(&mut self) -> Result<()> {
+        for builder in &mut self.field_builders {
+            builder.append_null()?;
+        }
+        self.nulls.append_null();
+        Ok(())
+    }
+
+    fn append_value(&mut self, value: &Variant<'_, '_>) -> Result<bool> {
+        match variant_cast_with_options(value, self.cast_options, Variant::as_object) {
+            Ok(Some(obj)) => {
+                for (index, field) in self.fields.iter().enumerate() {
+                    match obj.get(field.name()) {
+                        Some(field_value) => {
+                            self.field_builders[index].append_value(field_value)?;
+                        }
+                        None => {
+                            self.field_builders[index].append_null()?;
+                        }
+                    }
+                }
+
+                self.nulls.append_non_null();
+                Ok(true)
+            }
+            Ok(None) => {
+                self.append_null()?;
+                Ok(false)
+            }
+            Err(_) => Err(ArrowError::CastError(format!(
+                "Failed to extract struct from variant {value:?}"
+            ))),
+        }
+    }
+
+    fn finish(mut self) -> Result<ArrayRef> {
+        let mut children = Vec::with_capacity(self.field_builders.len());
+        for builder in self.field_builders {
+            children.push(builder.finish()?);
+        }
+        Ok(Arc::new(StructArray::try_new(
+            self.fields.clone(),
+            children,
+            self.nulls.finish(),
+        )?))
+    }
+}
+
 impl<'a> ArrayVariantToArrowRowBuilder<'a> {
+    /// Creates a new list builder for the given data type.
+    ///
+    /// # Arguments
+    /// * `shredded` - If true, element builders produce shredded structs with `value`/`typed_value`
+    ///   fields (for [`crate::shred_variant()`]). If false, element builders produce strongly typed
+    ///   arrays directly (for [`crate::variant_get()`]).
     pub(crate) fn try_new(
         data_type: &'a DataType,
         cast_options: &'a CastOptions,
         capacity: usize,
+        shredded: bool,
     ) -> Result<Self> {
         use ArrayVariantToArrowRowBuilder::*;
 
@@ -503,6 +608,7 @@ impl<'a> ArrayVariantToArrowRowBuilder<'a> {
                     $field.data_type(),
                     cast_options,
                     capacity,
+                    shredded,
                 )?)
             };
         }
@@ -526,7 +632,7 @@ impl<'a> ArrayVariantToArrowRowBuilder<'a> {
         Ok(builder)
     }
 
-    pub(crate) fn append_null(&mut self) {
+    pub(crate) fn append_null(&mut self) -> Result<()> {
         match self {
             Self::List(builder) => builder.append_null(),
             Self::LargeList(builder) => builder.append_null(),
@@ -535,12 +641,12 @@ impl<'a> ArrayVariantToArrowRowBuilder<'a> {
         }
     }
 
-    pub(crate) fn append_value(&mut self, list: VariantList<'_, '_>) -> Result<()> {
+    pub(crate) fn append_value(&mut self, value: &Variant<'_, '_>) -> Result<bool> {
         match self {
-            Self::List(builder) => builder.append_value(list),
-            Self::LargeList(builder) => builder.append_value(list),
-            Self::ListView(builder) => builder.append_value(list),
-            Self::LargeListView(builder) => builder.append_value(list),
+            Self::List(builder) => builder.append_value(value),
+            Self::LargeList(builder) => builder.append_value(value),
+            Self::ListView(builder) => builder.append_value(value),
+            Self::LargeListView(builder) => builder.append_value(value),
         }
     }
 
@@ -610,21 +716,24 @@ macro_rules! define_variant_to_primitive_builder {
             }
 
             fn append_value(&mut self, $value: &Variant<'_, '_>) -> Result<bool> {
-                if let Some(v) = $value_transform {
-                    self.builder.append_value(v);
-                    Ok(true)
-                } else {
-                    if !self.cast_options.safe {
-                        // Unsafe casting: return error on conversion failure
-                        return Err(ArrowError::CastError(format!(
-                            "Failed to extract primitive of type {} from variant {:?} at path VariantPath([])",
-                            $type_name,
-                            $value
-                        )));
+                match variant_cast_with_options(
+                    $value,
+                    self.cast_options,
+                    |$value| $value_transform,
+                ) {
+                    Ok(Some(v)) => {
+                        self.builder.append_value(v);
+                        Ok(true)
                     }
-                    // Safe casting: append null on conversion failure
-                    self.builder.append_null();
-                    Ok(false)
+                    Ok(None) => {
+                        self.builder.append_null();
+                        Ok(false)
+                    }
+                    Err(_) => Err(ArrowError::CastError(format!(
+                        "Failed to extract primitive of type {type_name} from variant {value:?} at path VariantPath([])",
+                        type_name = $type_name,
+                        value = $value
+                    ))),
                 }
             }
 
@@ -632,7 +741,10 @@ macro_rules! define_variant_to_primitive_builder {
             // This is mainly for `FakeNullBuilder`
             #[allow(unused_mut)]
             fn finish(mut self) -> Result<ArrayRef> {
-                Ok(Arc::new(self.builder.finish()))
+                // If the builder produces T: Array, the compiler infers `<Arc<T> as From<T>>::from`
+                // (which then coerces to ArrayRef). If the builder produces ArrayRef directly, the
+                // compiler infers `<ArrayRef as From<ArrayRef>>::from` (no-op, From blanket impl).
+                Ok(Arc::from(self.builder.finish()))
             }
         }
     }
@@ -648,7 +760,7 @@ define_variant_to_primitive_builder!(
 define_variant_to_primitive_builder!(
     struct VariantToBooleanArrowRowBuilder<'a>
     |capacity| -> BooleanBuilder { BooleanBuilder::with_capacity(capacity) },
-    |value|  value.as_boolean(),
+    |value| value.as_boolean(),
     type_name: datatypes::BooleanType::DATA_TYPE
 );
 
@@ -721,20 +833,23 @@ where
     }
 
     fn append_value(&mut self, value: &Variant<'_, '_>) -> Result<bool> {
-        if let Some(scaled) = variant_to_unscaled_decimal::<T>(value, self.precision, self.scale) {
-            self.builder.append_value(scaled);
-            Ok(true)
-        } else if self.cast_options.safe {
-            self.builder.append_null();
-            Ok(false)
-        } else {
-            Err(ArrowError::CastError(format!(
-                "Failed to cast to {}(precision={}, scale={}) from variant {:?}",
-                T::PREFIX,
-                self.precision,
-                self.scale,
-                value
-            )))
+        match variant_cast_with_options(value, self.cast_options, |value| {
+            variant_to_unscaled_decimal::<T>(value, self.precision, self.scale)
+        }) {
+            Ok(Some(scaled)) => {
+                self.builder.append_value(scaled);
+                Ok(true)
+            }
+            Ok(None) => {
+                self.builder.append_null();
+                Ok(false)
+            }
+            Err(_) => Err(ArrowError::CastError(format!(
+                "Failed to cast to {prefix}(precision={precision}, scale={scale}) from variant {value:?}",
+                prefix = T::PREFIX,
+                precision = self.precision,
+                scale = self.scale
+            ))),
         }
     }
 
@@ -763,20 +878,19 @@ impl<'a> VariantToUuidArrowRowBuilder<'a> {
     }
 
     fn append_value(&mut self, value: &Variant<'_, '_>) -> Result<bool> {
-        match value.as_uuid() {
-            Some(uuid) => {
+        match variant_cast_with_options(value, self.cast_options, Variant::as_uuid) {
+            Ok(Some(uuid)) => {
                 self.builder
                     .append_value(uuid.as_bytes())
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
-
                 Ok(true)
             }
-            None if self.cast_options.safe => {
+            Ok(None) => {
                 self.builder.append_null();
                 Ok(false)
             }
-            None => Err(ArrowError::CastError(format!(
-                "Failed to extract UUID from variant {value:?}",
+            Err(_) => Err(ArrowError::CastError(format!(
+                "Failed to extract UUID from variant {value:?}"
             ))),
         }
     }
@@ -786,15 +900,48 @@ impl<'a> VariantToUuidArrowRowBuilder<'a> {
     }
 }
 
+/// Element builder for list variants, supporting both typed (for [`crate::variant_get()`])
+/// and shredded (for [`crate::shred_variant()`]) output modes.
+enum ListElementBuilder<'a> {
+    /// Produces the target array type directly.
+    Typed(Box<VariantToArrowRowBuilder<'a>>),
+    /// Produces a shredded struct with `value` and `typed_value` fields.
+    Shredded(Box<VariantToShreddedVariantRowBuilder<'a>>),
+}
+
+impl<'a> ListElementBuilder<'a> {
+    fn append_value(&mut self, value: Variant<'_, '_>) -> Result<bool> {
+        match self {
+            Self::Typed(b) => b.append_value(value),
+            Self::Shredded(b) => b.append_value(value),
+        }
+    }
+
+    fn finish(self) -> Result<ArrayRef> {
+        match self {
+            Self::Typed(b) => b.finish(),
+            Self::Shredded(b) => {
+                let (value, typed_value, nulls) = b.finish()?;
+                Ok(ArrayRef::from(ShreddedVariantFieldArray::from_parts(
+                    Some(Arc::new(value)),
+                    Some(typed_value),
+                    nulls,
+                )))
+            }
+        }
+    }
+}
+
 pub(crate) struct VariantToListArrowRowBuilder<'a, O, const IS_VIEW: bool>
 where
     O: OffsetSizeTrait + ArrowNativeTypeOp,
 {
     field: FieldRef,
     offsets: Vec<O>,
-    element_builder: Box<VariantToShreddedVariantRowBuilder<'a>>,
+    element_builder: ListElementBuilder<'a>,
     nulls: NullBufferBuilder,
     current_offset: O,
+    cast_options: &'a CastOptions<'a>,
 }
 
 impl<'a, O, const IS_VIEW: bool> VariantToListArrowRowBuilder<'a, O, IS_VIEW>
@@ -806,6 +953,7 @@ where
         element_data_type: &'a DataType,
         cast_options: &'a CastOptions,
         capacity: usize,
+        shredded: bool,
     ) -> Result<Self> {
         if capacity >= isize::MAX as usize {
             return Err(ArrowError::ComputeError(
@@ -814,40 +962,59 @@ where
         }
         let mut offsets = Vec::with_capacity(capacity + 1);
         offsets.push(O::ZERO);
-        let element_builder = make_variant_to_shredded_variant_arrow_row_builder(
-            element_data_type,
-            cast_options,
-            capacity,
-            false,
-        )?;
+        let element_builder = if shredded {
+            let builder = make_variant_to_shredded_variant_arrow_row_builder(
+                element_data_type,
+                cast_options,
+                capacity,
+                NullValue::ArrayElement,
+            )?;
+            ListElementBuilder::Shredded(Box::new(builder))
+        } else {
+            let builder =
+                make_typed_variant_to_arrow_row_builder(element_data_type, cast_options, capacity)?;
+            ListElementBuilder::Typed(Box::new(builder))
+        };
+
         Ok(Self {
             field,
             offsets,
-            element_builder: Box::new(element_builder),
+            element_builder,
             nulls: NullBufferBuilder::new(capacity),
             current_offset: O::ZERO,
+            cast_options,
         })
     }
 
-    fn append_null(&mut self) {
+    fn append_null(&mut self) -> Result<()> {
         self.offsets.push(self.current_offset);
         self.nulls.append_null();
-    }
-
-    fn append_value(&mut self, list: VariantList<'_, '_>) -> Result<()> {
-        for element in list.iter() {
-            self.element_builder.append_value(element)?;
-            self.current_offset = self.current_offset.add_checked(O::ONE)?;
-        }
-        self.offsets.push(self.current_offset);
-        self.nulls.append_non_null();
         Ok(())
     }
 
+    fn append_value(&mut self, value: &Variant<'_, '_>) -> Result<bool> {
+        match variant_cast_with_options(value, self.cast_options, Variant::as_list) {
+            Ok(Some(list)) => {
+                for element in list.iter() {
+                    self.element_builder.append_value(element)?;
+                    self.current_offset = self.current_offset.add_checked(O::ONE)?;
+                }
+                self.offsets.push(self.current_offset);
+                self.nulls.append_non_null();
+                Ok(true)
+            }
+            Ok(None) => {
+                self.append_null()?;
+                Ok(false)
+            }
+            Err(_) => Err(ArrowError::CastError(format!(
+                "Failed to extract list from variant {value:?}"
+            ))),
+        }
+    }
+
     fn finish(mut self) -> Result<ArrayRef> {
-        let (value, typed_value, nulls) = self.element_builder.finish()?;
-        let element_array =
-            ShreddedVariantFieldArray::from_parts(Some(value), Some(typed_value), nulls);
+        let element_array: ArrayRef = self.element_builder.finish()?;
         let field = Arc::new(
             self.field
                 .as_ref()
@@ -866,7 +1033,7 @@ where
                 field,
                 ScalarBuffer::from(self.offsets),
                 ScalarBuffer::from(sizes),
-                ArrayRef::from(element_array),
+                element_array,
                 self.nulls.finish(),
             );
             Ok(Arc::new(list_view_array))
@@ -874,7 +1041,7 @@ where
             let list_array = GenericListArray::<O>::new(
                 field,
                 OffsetBuffer::<O>::new(ScalarBuffer::from(self.offsets)),
-                ArrayRef::from(element_array),
+                element_array,
                 self.nulls.finish(),
             );
             Ok(Arc::new(list_array))
@@ -884,13 +1051,13 @@ where
 
 /// Builder for creating VariantArray output (for path extraction without type conversion)
 pub(crate) struct VariantToBinaryVariantArrowRowBuilder {
-    metadata: BinaryViewArray,
+    metadata: ArrayRef,
     builder: VariantValueArrayBuilder,
     nulls: NullBufferBuilder,
 }
 
 impl VariantToBinaryVariantArrowRowBuilder {
-    fn new(metadata: BinaryViewArray, capacity: usize) -> Self {
+    fn new(metadata: ArrayRef, capacity: usize) -> Self {
         Self {
             metadata,
             builder: VariantValueArrayBuilder::new(capacity),
@@ -915,7 +1082,7 @@ impl VariantToBinaryVariantArrowRowBuilder {
     fn finish(mut self) -> Result<ArrayRef> {
         let variant_array = VariantArray::from_parts(
             self.metadata,
-            Some(self.builder.build()?),
+            Some(Arc::new(self.builder.build()?)),
             None, // no typed_value column
             self.nulls.finish(),
         );
@@ -952,11 +1119,18 @@ define_variant_to_primitive_builder!(
 
 #[cfg(test)]
 mod tests {
-    use super::make_primitive_variant_to_arrow_row_builder;
+    use super::{
+        make_primitive_variant_to_arrow_row_builder, make_typed_variant_to_arrow_row_builder,
+    };
+    use arrow::array::{
+        Array, Decimal32Array, FixedSizeBinaryArray, Int32Array, ListArray, StructArray,
+    };
     use arrow::compute::CastOptions;
     use arrow::datatypes::{DataType, Field, Fields, UnionFields, UnionMode};
     use arrow::error::ArrowError;
+    use parquet_variant::{Variant, VariantDecimal4};
     use std::sync::Arc;
+    use uuid::Uuid;
 
     #[test]
     fn make_primitive_builder_rejects_non_primitive_types() {
@@ -1004,5 +1178,98 @@ mod tests {
                 other => panic!("expected InvalidArgumentError, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn strict_cast_allows_variant_null_for_primitive_builder() {
+        let cast_options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        let mut builder =
+            make_primitive_variant_to_arrow_row_builder(&DataType::Int32, &cast_options, 2)
+                .unwrap();
+
+        assert!(!builder.append_value(&Variant::Null).unwrap());
+        assert!(builder.append_value(&Variant::Int32(42)).unwrap());
+
+        let array = builder.finish().unwrap();
+        let int_array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert!(int_array.is_null(0));
+        assert_eq!(int_array.value(1), 42);
+    }
+
+    #[test]
+    fn strict_cast_allows_variant_null_for_decimal_builder() {
+        let cast_options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        let mut builder = make_primitive_variant_to_arrow_row_builder(
+            &DataType::Decimal32(9, 2),
+            &cast_options,
+            2,
+        )
+        .unwrap();
+        let decimal_variant: Variant<'_, '_> = VariantDecimal4::try_new(1234, 2).unwrap().into();
+
+        assert!(!builder.append_value(&Variant::Null).unwrap());
+        assert!(builder.append_value(&decimal_variant).unwrap());
+
+        let array = builder.finish().unwrap();
+        let decimal_array = array.as_any().downcast_ref::<Decimal32Array>().unwrap();
+        assert!(decimal_array.is_null(0));
+        assert_eq!(decimal_array.value(1), 1234);
+    }
+
+    #[test]
+    fn strict_cast_allows_variant_null_for_uuid_builder() {
+        let cast_options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        let mut builder = make_primitive_variant_to_arrow_row_builder(
+            &DataType::FixedSizeBinary(16),
+            &cast_options,
+            2,
+        )
+        .unwrap();
+        let uuid = Uuid::nil();
+
+        assert!(!builder.append_value(&Variant::Null).unwrap());
+        assert!(builder.append_value(&Variant::Uuid(uuid)).unwrap());
+
+        let array = builder.finish().unwrap();
+        let uuid_array = array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert!(uuid_array.is_null(0));
+        assert_eq!(uuid_array.value(1), uuid.as_bytes());
+    }
+
+    #[test]
+    fn strict_cast_allows_variant_null_for_list_and_struct_builders() {
+        let cast_options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let mut list_builder =
+            make_typed_variant_to_arrow_row_builder(&list_type, &cast_options, 1).unwrap();
+        assert!(!list_builder.append_value(Variant::Null).unwrap());
+        let list_array = list_builder.finish().unwrap();
+        let list_array = list_array.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(list_array.is_null(0));
+
+        let struct_type =
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)]));
+        let mut struct_builder =
+            make_typed_variant_to_arrow_row_builder(&struct_type, &cast_options, 1).unwrap();
+        assert!(!struct_builder.append_value(Variant::Null).unwrap());
+        let struct_array = struct_builder.finish().unwrap();
+        let struct_array = struct_array.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(struct_array.is_null(0));
     }
 }

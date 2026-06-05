@@ -106,6 +106,36 @@ impl<T: ParquetValueType> PrimitiveColumnIndex<T> {
     ) -> Result<Self> {
         let len = null_pages.len();
 
+        if min_bytes.len() != len || max_bytes.len() != len {
+            return Err(ParquetError::General(format!(
+                "ColumnIndex min/max length mismatch: expected {len}, got min={} max={}",
+                min_bytes.len(),
+                max_bytes.len()
+            )));
+        }
+        if let Some(ref nc) = null_counts {
+            if nc.len() != len {
+                return Err(ParquetError::General(format!(
+                    "ColumnIndex null_counts length mismatch: expected {len}, got {}",
+                    nc.len()
+                )));
+            }
+        }
+        if let Some(ref rep) = repetition_level_histograms {
+            if len != 0 && rep.len() % len != 0 {
+                return Err(ParquetError::General(
+                    "Invalid repetition_level_histograms length".to_string(),
+                ));
+            }
+        }
+        if let Some(ref def) = definition_level_histograms {
+            if len != 0 && def.len() % len != 0 {
+                return Err(ParquetError::General(
+                    "Invalid definition_level_histograms length".to_string(),
+                ));
+            }
+        }
+
         let mut min_values = Vec::with_capacity(len);
         let mut max_values = Vec::with_capacity(len);
 
@@ -195,6 +225,7 @@ impl<T> PrimitiveColumnIndex<T> {
     /// Returns the min value for the page indexed by `idx`
     ///
     /// It is `None` when all values are null
+    #[inline]
     pub fn min_value(&self, idx: usize) -> Option<&T> {
         if self.null_pages[idx] {
             None
@@ -206,6 +237,7 @@ impl<T> PrimitiveColumnIndex<T> {
     /// Returns the max value for the page indexed by `idx`
     ///
     /// It is `None` when all values are null
+    #[inline]
     pub fn max_value(&self, idx: usize) -> Option<&T> {
         if self.null_pages[idx] {
             None
@@ -292,6 +324,36 @@ impl ByteArrayColumnIndex {
         max_values: Vec<&[u8]>,
     ) -> Result<Self> {
         let len = null_pages.len();
+
+        if min_values.len() != len || max_values.len() != len {
+            return Err(ParquetError::General(format!(
+                "ColumnIndex min/max length mismatch: expected {len}, got min={} max={}",
+                min_values.len(),
+                max_values.len()
+            )));
+        }
+        if let Some(ref nc) = null_counts {
+            if nc.len() != len {
+                return Err(ParquetError::General(format!(
+                    "ColumnIndex null_counts length mismatch: expected {len}, got {}",
+                    nc.len()
+                )));
+            }
+        }
+        if let Some(ref rep) = repetition_level_histograms {
+            if len != 0 && rep.len() % len != 0 {
+                return Err(ParquetError::General(
+                    "Invalid repetition_level_histograms length".to_string(),
+                ));
+            }
+        }
+        if let Some(ref def) = definition_level_histograms {
+            if len != 0 && def.len() % len != 0 {
+                return Err(ParquetError::General(
+                    "Invalid definition_level_histograms length".to_string(),
+                ));
+            }
+        }
 
         let min_len = min_values.iter().map(|&v| v.len()).sum();
         let max_len = max_values.iter().map(|&v| v.len()).sum();
@@ -383,26 +445,14 @@ impl ByteArrayColumnIndex {
     ///
     /// Values may be `None` when [`ColumnIndex::is_null_page()`] is `true`.
     pub fn min_values_iter(&self) -> impl Iterator<Item = Option<&[u8]>> {
-        (0..self.num_pages() as usize).map(|i| {
-            if self.is_null_page(i) {
-                None
-            } else {
-                self.min_value(i)
-            }
-        })
+        (0..self.num_pages() as usize).map(|i| self.min_value(i))
     }
 
     /// Returns an iterator over the max values.
     ///
     /// Values may be `None` when [`ColumnIndex::is_null_page()`] is `true`.
     pub fn max_values_iter(&self) -> impl Iterator<Item = Option<&[u8]>> {
-        (0..self.num_pages() as usize).map(|i| {
-            if self.is_null_page(i) {
-                None
-            } else {
-                self.max_value(i)
-            }
-        })
+        (0..self.num_pages() as usize).map(|i| self.max_value(i))
     }
 }
 
@@ -596,6 +646,7 @@ impl ColumnIndexMetaData {
     }
 
     /// Returns whether the page indexed by `idx` consists of all null values
+    #[inline]
     pub fn is_null_page(&self, idx: usize) -> bool {
         colidx_enum_func!(self, is_null_page, idx)
     }
@@ -746,5 +797,25 @@ mod tests {
             err.to_string(),
             "Parquet error: error converting value, expected 4 bytes got 0"
         );
+    }
+
+    #[test]
+    fn test_column_index_rejects_mismatched_min_max_lengths() {
+        // Two pages, but only one min/max entry. The entry itself is valid i32 bytes,
+        // so this specifically checks that lengths must match the number of pages.
+        let column_index = ThriftColumnIndex {
+            null_pages: vec![false, false],
+            min_values: vec![&[1u8, 0, 0, 0]],
+            max_values: vec![&[10u8, 0, 0, 0]],
+            null_counts: None,
+            repetition_level_histograms: None,
+            definition_level_histograms: None,
+            boundary_order: BoundaryOrder::UNORDERED,
+        };
+
+        // ColumnIndex arrays must align with the number of pages (null_pages.len()).
+        let err = PrimitiveColumnIndex::<i32>::try_from_thrift(column_index).unwrap_err();
+        // Should fail because min/max lengths don’t match null_pages
+        assert!(err.to_string().contains("length mismatch"));
     }
 }
