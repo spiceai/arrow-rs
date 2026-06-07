@@ -112,6 +112,10 @@ impl MutableBuffer {
     /// Allocate a new [MutableBuffer] with initial capacity to be at least `capacity`.
     ///
     /// See [`MutableBuffer::with_capacity`].
+    ///
+    /// # Panics
+    ///
+    /// See [`MutableBuffer::with_capacity`].
     #[inline]
     pub fn new(capacity: usize) -> Self {
         Self::with_capacity(capacity)
@@ -156,6 +160,10 @@ impl MutableBuffer {
     /// let data = buffer.as_slice_mut();
     /// assert_eq!(data[126], 0u8);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` is too large to construct a valid allocation [`Layout`]
     pub fn from_len_zeroed(len: usize) -> Self {
         let layout = Layout::from_size_align(len, ALIGNMENT).unwrap();
         let data = match layout.size() {
@@ -199,6 +207,10 @@ impl MutableBuffer {
 
     /// creates a new [MutableBuffer] with capacity and length capable of holding `len` bits.
     /// This is useful to create a buffer for packed bitmaps.
+    ///
+    /// # Panics
+    ///
+    /// See [`MutableBuffer::from_len_zeroed`].
     pub fn new_null(len: usize) -> Self {
         let num_bytes = bit_util::ceil(len, 8);
         MutableBuffer::from_len_zeroed(num_bytes)
@@ -210,6 +222,10 @@ impl MutableBuffer {
     /// This is useful when one wants to clear (or set) the bits and then manipulate
     /// the buffer directly (e.g., modifying the buffer by holding a mutable reference
     /// from `data_mut()`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `end` exceeds the buffer capacity.
     pub fn with_bitset(mut self, end: usize, val: bool) -> Self {
         assert!(end <= self.layout.size());
         let v = if val { 255 } else { 0 };
@@ -225,6 +241,10 @@ impl MutableBuffer {
     /// This is used to initialize the bits in a buffer, however, it has no impact on the
     /// `len` of the buffer and so can be used to initialize the memory region from
     /// `len` to `capacity`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the byte range `start..start + count` exceeds the buffer capacity.
     pub fn set_null_bits(&mut self, start: usize, count: usize) {
         assert!(
             start.saturating_add(count) <= self.layout.size(),
@@ -250,11 +270,19 @@ impl MutableBuffer {
     /// let buffer: Buffer = buffer.into();
     /// assert_eq!(buffer.len(), 253);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.len + additional` overflows `usize`, or if the required capacity is too
+    /// large to round up to the next 64-byte boundary and construct a valid allocation layout.
     // For performance reasons, this must be inlined so that the `if` is executed inside the caller, and not as an extra call that just
     // exits.
     #[inline(always)]
     pub fn reserve(&mut self, additional: usize) {
-        let required_cap = self.len + additional;
+        let required_cap = self
+            .len
+            .checked_add(additional)
+            .expect("buffer length overflow");
         if required_cap > self.layout.size() {
             let new_capacity = bit_util::round_upto_multiple_of_64(required_cap);
             let new_capacity = std::cmp::max(new_capacity, self.layout.size() * 2);
@@ -274,6 +302,12 @@ impl MutableBuffer {
     /// buffer.repeat_slice_n_times(bytes_to_repeat, 3);
     /// assert_eq!(buffer.as_slice(), b"ababab");
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the repeated slice byte length overflows `usize`, if the resulting buffer
+    /// length overflows `usize`, or if reserving the required capacity fails for the same
+    /// reasons as [`MutableBuffer::reserve`].
     pub fn repeat_slice_n_times<T: ArrowNativeType>(
         &mut self,
         slice_to_repeat: &[T],
@@ -284,9 +318,15 @@ impl MutableBuffer {
         }
 
         let bytes_to_repeat = size_of_val(slice_to_repeat);
+        let repeated_bytes = repeat_count
+            .checked_mul(bytes_to_repeat)
+            .expect("repeated slice byte length overflow");
+        self.len
+            .checked_add(repeated_bytes)
+            .expect("mutable buffer length overflow");
 
         // Ensure capacity
-        self.reserve(repeat_count * bytes_to_repeat);
+        self.reserve(repeated_bytes);
 
         // Save the length before we do all the copies to know where to start from
         let length_before = self.len;
@@ -385,6 +425,11 @@ impl MutableBuffer {
     /// buffer.resize(253, 2); // allocates for the first time
     /// assert_eq!(buffer.as_slice()[252], 2u8);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if growing the buffer requires reserving a capacity that fails for the same
+    /// reasons as [`MutableBuffer::reserve`].
     // For performance reasons, this must be inlined so that the `if` is executed inside the caller, and not as an extra call that just
     // exits.
     #[inline(always)]
@@ -420,6 +465,11 @@ impl MutableBuffer {
     /// buffer.shrink_to_fit();
     /// assert!(buffer.capacity() >= 64 && buffer.capacity() < 128);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the current length is too large to round up to the next 64-byte boundary and
+    /// construct a valid allocation layout.
     pub fn shrink_to_fit(&mut self) {
         let new_capacity = bit_util::round_upto_multiple_of_64(self.len);
         if new_capacity < self.layout.size() {
@@ -450,7 +500,13 @@ impl MutableBuffer {
 
     /// Clear all existing data from this buffer.
     pub fn clear(&mut self) {
-        self.len = 0
+        self.len = 0;
+        #[cfg(feature = "pool")]
+        {
+            if let Some(reservation) = self.reservation.lock().unwrap().as_mut() {
+                reservation.resize(self.len);
+            }
+        }
     }
 
     /// Returns the data stored in this buffer as a slice.
@@ -493,8 +549,8 @@ impl MutableBuffer {
     ///
     /// # Panics
     ///
-    /// This function panics if the underlying buffer is not aligned
-    /// correctly for type `T`.
+    /// This function panics if the underlying buffer is not aligned correctly for type `T`, or
+    /// if its length is not a multiple of `size_of::<T>()`.
     pub fn typed_data_mut<T: ArrowNativeType>(&mut self) -> &mut [T] {
         // SAFETY
         // ArrowNativeType is trivially transmutable, is sealed to prevent potentially incorrect
@@ -508,8 +564,8 @@ impl MutableBuffer {
     ///
     /// # Panics
     ///
-    /// This function panics if the underlying buffer is not aligned
-    /// correctly for type `T`.
+    /// This function panics if the underlying buffer is not aligned correctly for type `T`, or
+    /// if its length is not a multiple of `size_of::<T>()`.
     pub fn typed_data<T: ArrowNativeType>(&self) -> &[T] {
         // SAFETY
         // ArrowNativeType is trivially transmutable, is sealed to prevent potentially incorrect
@@ -527,6 +583,11 @@ impl MutableBuffer {
     /// buffer.extend_from_slice(&[2u32, 0]);
     /// assert_eq!(buffer.len(), 8) // u32 has 4 bytes
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if extending the buffer requires reserving a capacity that fails for the same
+    /// reasons as [`MutableBuffer::reserve`].
     #[inline]
     pub fn extend_from_slice<T: ArrowNativeType>(&mut self, items: &[T]) {
         let additional = mem::size_of_val(items);
@@ -550,6 +611,11 @@ impl MutableBuffer {
     /// buffer.push(256u32);
     /// assert_eq!(buffer.len(), 4) // u32 has 4 bytes
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if extending the buffer requires reserving a capacity that fails for the same
+    /// reasons as [`MutableBuffer::reserve`].
     #[inline]
     pub fn push<T: ToByteSlice>(&mut self, item: T) {
         let additional = std::mem::size_of::<T>();
@@ -575,13 +641,26 @@ impl MutableBuffer {
     }
 
     /// Extends the buffer by `additional` bytes equal to `0u8`, incrementing its capacity if needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.len + additional` overflows `usize`, or if growing the buffer requires
+    /// reserving a capacity that fails for the same reasons as [`MutableBuffer::reserve`].
     #[inline]
     pub fn extend_zeros(&mut self, additional: usize) {
-        self.resize(self.len + additional, 0);
+        let new_len = self
+            .len
+            .checked_add(additional)
+            .expect("buffer length overflow");
+        self.resize(new_len, 0);
     }
 
     /// # Safety
     /// The caller must ensure that the buffer was properly initialized up to `len`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds the buffer capacity.
     #[inline]
     pub unsafe fn set_len(&mut self, len: usize) {
         assert!(len <= self.capacity());
@@ -621,6 +700,141 @@ impl MutableBuffer {
         let mut buffer: MutableBuffer = buffer.into();
         buffer.truncate(bit_util::ceil(len, 8));
         buffer
+    }
+
+    /// Extends this buffer with boolean values.
+    ///
+    /// This requires `iter` to report an exact size via `size_hint`.
+    /// `offset` indicates the starting offset in bits in this buffer to begin writing to
+    /// and must be less than or equal to the current length of this buffer.
+    /// All bits not written to (but readable due to byte alignment) will be zeroed out.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `iter` does not report an exact size via `size_hint`, or if it yields fewer
+    /// items than reported, or if extending the buffer requires reserving a capacity that fails
+    /// for the same reasons as [`MutableBuffer::reserve`].
+    ///
+    /// # Safety
+    /// Callers must ensure that `iter` reports an exact size via `size_hint`.
+    #[inline]
+    pub unsafe fn extend_bool_trusted_len<I: Iterator<Item = bool>>(
+        &mut self,
+        mut iter: I,
+        offset: usize,
+    ) {
+        let (lower, upper) = iter.size_hint();
+        let len = upper.expect("Iterator must have exact size_hint");
+        assert_eq!(lower, len, "Iterator must have exact size_hint");
+        debug_assert!(
+            offset <= self.len * 8,
+            "offset must be <= buffer length in bits"
+        );
+
+        if len == 0 {
+            return;
+        }
+
+        let start_len = offset;
+        let end_bit = start_len + len;
+
+        // SAFETY: we will initialize all newly exposed bytes before they are read
+        let new_len_bytes = bit_util::ceil(end_bit, 8);
+        if new_len_bytes > self.len {
+            self.reserve(new_len_bytes - self.len);
+            // SAFETY: caller will initialize all newly exposed bytes before they are read
+            unsafe { self.set_len(new_len_bytes) };
+        }
+
+        let slice = self.as_slice_mut();
+
+        let mut bit_idx = start_len;
+
+        // ---- Unaligned prefix: advance to the next 64-bit boundary ----
+        let misalignment = bit_idx & 63;
+        let prefix_bits = if misalignment == 0 {
+            0
+        } else {
+            (64 - misalignment).min(end_bit - bit_idx)
+        };
+
+        if prefix_bits != 0 {
+            let byte_start = bit_idx / 8;
+            let byte_end = bit_util::ceil(bit_idx + prefix_bits, 8);
+            let bit_offset = bit_idx % 8;
+
+            // Clear any newly-visible bits in the existing partial byte
+            if bit_offset != 0 {
+                let keep_mask = (1u8 << bit_offset).wrapping_sub(1);
+                slice[byte_start] &= keep_mask;
+            }
+
+            // Zero any new bytes we will partially fill in this prefix
+            let zero_from = if bit_offset == 0 {
+                byte_start
+            } else {
+                byte_start + 1
+            };
+            if byte_end > zero_from {
+                slice[zero_from..byte_end].fill(0);
+            }
+
+            for _ in 0..prefix_bits {
+                let v = iter.next().unwrap();
+                if v {
+                    let byte_idx = bit_idx / 8;
+                    let bit = bit_idx % 8;
+                    slice[byte_idx] |= 1 << bit;
+                }
+                bit_idx += 1;
+            }
+        }
+
+        if bit_idx < end_bit {
+            // ---- Aligned middle: write u64 chunks ----
+            debug_assert_eq!(bit_idx & 63, 0);
+            let remaining_bits = end_bit - bit_idx;
+            let chunks = remaining_bits / 64;
+
+            let words_start = bit_idx / 8;
+            let words_end = words_start + chunks * 8;
+            for dst in slice[words_start..words_end].chunks_exact_mut(8) {
+                let mut packed: u64 = 0;
+                for i in 0..64 {
+                    packed |= (iter.next().unwrap() as u64) << i;
+                }
+                dst.copy_from_slice(&packed.to_le_bytes());
+                bit_idx += 64;
+            }
+
+            // ---- Unaligned suffix: remaining < 64 bits ----
+            let suffix_bits = end_bit - bit_idx;
+            if suffix_bits != 0 {
+                debug_assert_eq!(bit_idx % 8, 0);
+                let byte_start = bit_idx / 8;
+                let byte_end = bit_util::ceil(end_bit, 8);
+                slice[byte_start..byte_end].fill(0);
+
+                for _ in 0..suffix_bits {
+                    let v = iter.next().unwrap();
+                    if v {
+                        let byte_idx = bit_idx / 8;
+                        let bit = bit_idx % 8;
+                        slice[byte_idx] |= 1 << bit;
+                    }
+                    bit_idx += 1;
+                }
+            }
+        }
+
+        // Clear any unused bits in the last byte
+        let remainder = end_bit % 8;
+        if remainder != 0 {
+            let mask = (1u8 << remainder).wrapping_sub(1);
+            slice[bit_util::ceil(end_bit, 8) - 1] &= mask;
+        }
+
+        debug_assert_eq!(bit_idx, end_bit);
     }
 
     /// Register this [`MutableBuffer`] with the provided [`MemoryPool`]
@@ -726,6 +940,13 @@ impl MutableBuffer {
     /// let buffer = unsafe { MutableBuffer::from_trusted_len_iter(iter) };
     /// assert_eq!(buffer.len(), 4) // u32 has 4 bytes
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the iterator does not report an upper bound via `size_hint`, or if the
+    /// reported length does not match the number of items produced, or if allocating the
+    /// required buffer fails for the same reasons as [`MutableBuffer::new`].
+    ///
     /// # Safety
     /// This method assumes that the iterator's size is correct and is undefined behavior
     /// to use it on an iterator that reports an incorrect length.
@@ -770,6 +991,12 @@ impl MutableBuffer {
     /// let buffer = unsafe { MutableBuffer::from_trusted_len_iter_bool(iter) };
     /// assert_eq!(buffer.len(), 1) // 3 booleans have 1 byte
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the iterator does not report an upper bound via `size_hint`, or if it yields
+    /// fewer items than reported.
+    ///
     /// # Safety
     /// This method assumes that the iterator's size is correct and is undefined behavior
     /// to use it on an iterator that reports an incorrect length.
@@ -788,6 +1015,14 @@ impl MutableBuffer {
     /// Creates a [`MutableBuffer`] from an [`Iterator`] with a trusted (upper) length or errors
     /// if any of the items of the iterator is an error.
     /// Prefer this to `collect` whenever possible, as it is faster ~60% faster.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the iterator does not report an upper bound via `size_hint`, or if the
+    /// reported length does not match the number of items produced before an error-free finish,
+    /// or if allocating the required buffer fails for the same reasons as
+    /// [`MutableBuffer::new`].
+    ///
     /// # Safety
     /// This method assumes that the iterator's size is correct and is undefined behavior
     /// to use it on an iterator that reports an incorrect length.
@@ -1243,7 +1478,7 @@ mod tests {
             assert_eq!(pool.used(), 40);
 
             // Truncate to zero
-            buffer.truncate(0);
+            buffer.clear();
             assert_eq!(buffer.len(), 0);
             assert_eq!(pool.used(), 0);
         }
@@ -1338,6 +1573,21 @@ mod tests {
 
         // Zero repeats
         test_repeat_count(0, &[1i32, 2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "repeated slice byte length overflow")]
+    fn test_repeat_slice_count_multiply_overflow() {
+        let mut buffer = MutableBuffer::new(0);
+        buffer.repeat_slice_n_times(&[0_u64], usize::MAX / mem::size_of::<u64>() + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "mutable buffer length overflow")]
+    fn test_repeat_slice_count_len_overflow() {
+        let mut buffer = MutableBuffer::new(0);
+        buffer.push(0_u8);
+        buffer.repeat_slice_n_times(&[0_u8], usize::MAX);
     }
 
     #[test]

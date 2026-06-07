@@ -77,6 +77,13 @@ Please see the [Implementation Status Page] on the [Apache Parquet] website for
 information on the status of this implementation.
 
 [implementation status page]: https://parquet.apache.org/docs/file-format/implementationstatus/
+[apache parquet]: https://parquet.apache.org/
+
+## Security
+
+See the [Security Policy] for information on the security model and how to report vulnerabilities.
+
+[security policy]: https://github.com/apache/arrow-rs/blob/main/SECURITY.md
 
 ## License
 

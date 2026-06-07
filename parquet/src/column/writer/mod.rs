@@ -100,6 +100,15 @@ impl ColumnWriter<'_> {
         downcast_writer!(self, typed, typed.get_estimated_total_bytes())
     }
 
+    /// Finalize the currently buffered values as a data page.
+    ///
+    /// This is used by content-defined chunking to force a page boundary at
+    /// content-determined positions.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn add_data_page(&mut self) -> Result<()> {
+        downcast_writer!(self, typed, typed.add_data_page())
+    }
+
     /// Close this [`ColumnWriter`], returning the metadata for the column chunk.
     pub fn close(self) -> Result<ColumnCloseResult> {
         downcast_writer!(self, typed, typed.close())
@@ -236,20 +245,6 @@ impl PageMetrics {
             .as_mut()
             .map(LevelHistogram::reset);
     }
-
-    /// Updates histogram values using provided repetition levels
-    fn update_repetition_level_histogram(&mut self, levels: &[i16]) {
-        if let Some(ref mut rep_hist) = self.repetition_level_histogram {
-            rep_hist.update_from_levels(levels);
-        }
-    }
-
-    /// Updates histogram values using provided definition levels
-    fn update_definition_level_histogram(&mut self, levels: &[i16]) {
-        if let Some(ref mut def_hist) = self.definition_level_histogram {
-            def_hist.update_from_levels(levels);
-        }
-    }
 }
 
 // Metrics per column writer
@@ -342,9 +337,9 @@ pub struct GenericColumnWriter<'a, E: ColumnValueEncoder> {
     /// but we use a BTreeSet so that the output is deterministic
     encodings: BTreeSet<Encoding>,
     encoding_stats: Vec<PageEncodingStats>,
-    // Reused buffers
-    def_levels_sink: Vec<i16>,
-    rep_levels_sink: Vec<i16>,
+    // Streaming level encoders for definition/repetition levels.
+    def_levels_encoder: LevelEncoder,
+    rep_levels_encoder: LevelEncoder,
     data_pages: VecDeque<CompressedPage>,
     // column index and offset index
     column_index_builder: ColumnIndexBuilder,
@@ -402,6 +397,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         };
 
         Self {
+            def_levels_encoder: Self::create_level_encoder(descr.max_def_level(), &props),
+            rep_levels_encoder: Self::create_level_encoder(descr.max_rep_level(), &props),
             descr,
             props,
             statistics_enabled,
@@ -409,8 +406,6 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             codec,
             compressor,
             encoder,
-            def_levels_sink: vec![],
-            rep_levels_sink: vec![],
             data_pages: VecDeque::new(),
             page_metrics,
             column_metrics,
@@ -638,6 +633,14 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         })
     }
 
+    /// Creates a new streaming level encoder appropriate for the writer version.
+    fn create_level_encoder(max_level: i16, props: &WriterProperties) -> LevelEncoder {
+        match props.writer_version() {
+            WriterVersion::PARQUET_1_0 => LevelEncoder::v1_streaming(max_level),
+            WriterVersion::PARQUET_2_0 => LevelEncoder::v2_streaming(max_level),
+        }
+    }
+
     /// Writes mini batch of values, definition and repetition levels.
     /// This allows fine-grained processing of values and maintaining a reasonable
     /// page size.
@@ -659,16 +662,19 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                 )
             })?;
 
-            let values_to_write = levels
-                .iter()
-                .map(|level| (*level == self.descr.max_def_level()) as usize)
-                .sum();
+            let mut values_to_write = 0usize;
+            let max_def = self.descr.max_def_level();
+            let encoder = &mut self.def_levels_encoder;
+            match self.page_metrics.definition_level_histogram.as_mut() {
+                Some(histogram) => encoder.put_with_observer(levels, |level, count| {
+                    values_to_write += count * (level == max_def) as usize;
+                    histogram.increment_by(level, count as i64);
+                }),
+                None => encoder.put_with_observer(levels, |level, count| {
+                    values_to_write += count * (level == max_def) as usize;
+                }),
+            };
             self.page_metrics.num_page_nulls += (levels.len() - values_to_write) as u64;
-
-            // Update histogram
-            self.page_metrics.update_definition_level_histogram(levels);
-
-            self.def_levels_sink.extend_from_slice(levels);
             values_to_write
         } else {
             num_levels
@@ -691,15 +697,18 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                 ));
             }
 
-            // Count the occasions where we start a new row
-            for &level in levels {
-                self.page_metrics.num_buffered_rows += (level == 0) as u32
-            }
-
-            // Update histogram
-            self.page_metrics.update_repetition_level_histogram(levels);
-
-            self.rep_levels_sink.extend_from_slice(levels);
+            let mut new_rows = 0u32;
+            let encoder = &mut self.rep_levels_encoder;
+            match self.page_metrics.repetition_level_histogram.as_mut() {
+                Some(histogram) => encoder.put_with_observer(levels, |level, count| {
+                    new_rows += (count as u32) * (level == 0) as u32;
+                    histogram.increment_by(level, count as i64);
+                }),
+                None => encoder.put_with_observer(levels, |level, count| {
+                    new_rows += (count as u32) * (level == 0) as u32;
+                }),
+            };
+            self.page_metrics.num_buffered_rows += new_rows;
         } else {
             // Each value is exactly one row.
             // Equals to the number of values, we count nulls as well.
@@ -755,7 +764,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         }
 
         self.page_metrics.num_buffered_rows as usize >= self.props.data_page_row_count_limit()
-            || self.encoder.estimated_data_page_size() >= self.props.data_page_size_limit()
+            || self.encoder.estimated_data_page_size()
+                >= self.props.column_data_page_size_limit(self.descr.path())
     }
 
     /// Performs dictionary fallback.
@@ -1000,7 +1010,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
     /// Adds data page.
     /// Data page is either buffered in case of dictionary encoding or written directly.
-    fn add_data_page(&mut self) -> Result<()> {
+    pub(crate) fn add_data_page(&mut self) -> Result<()> {
         // Extract encoded values
         let values_data = self.encoder.flush_data_page()?;
 
@@ -1050,23 +1060,13 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                 let mut buffer = vec![];
 
                 if max_rep_level > 0 {
-                    buffer.extend_from_slice(
-                        &self.encode_levels_v1(
-                            Encoding::RLE,
-                            &self.rep_levels_sink[..],
-                            max_rep_level,
-                        )[..],
-                    );
+                    self.rep_levels_encoder
+                        .flush_to(|data| buffer.extend_from_slice(data));
                 }
 
                 if max_def_level > 0 {
-                    buffer.extend_from_slice(
-                        &self.encode_levels_v1(
-                            Encoding::RLE,
-                            &self.def_levels_sink[..],
-                            max_def_level,
-                        )[..],
-                    );
+                    self.def_levels_encoder
+                        .flush_to(|data| buffer.extend_from_slice(data));
                 }
 
                 buffer.extend_from_slice(&values_data.buf);
@@ -1096,15 +1096,15 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                 let mut buffer = vec![];
 
                 if max_rep_level > 0 {
-                    let levels = self.encode_levels_v2(&self.rep_levels_sink[..], max_rep_level);
-                    rep_levels_byte_len = levels.len();
-                    buffer.extend_from_slice(&levels[..]);
+                    self.rep_levels_encoder
+                        .flush_to(|data| buffer.extend_from_slice(data));
+                    rep_levels_byte_len = buffer.len();
                 }
 
                 if max_def_level > 0 {
-                    let levels = self.encode_levels_v2(&self.def_levels_sink[..], max_def_level);
-                    def_levels_byte_len = levels.len();
-                    buffer.extend_from_slice(&levels[..]);
+                    self.def_levels_encoder
+                        .flush_to(|data| buffer.extend_from_slice(data));
+                    def_levels_byte_len = buffer.len() - rep_levels_byte_len;
                 }
 
                 let uncompressed_size =
@@ -1115,7 +1115,12 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                     Some(ref mut cmpr) => {
                         let buffer_len = buffer.len();
                         cmpr.compress(&values_data.buf, &mut buffer)?;
-                        if uncompressed_size <= buffer.len() - buffer_len {
+                        let compressed_values_size = buffer.len() - buffer_len;
+                        let threshold = self
+                            .props
+                            .column_data_page_v2_compression_ratio_threshold(self.descr.path());
+                        if (compressed_values_size as f64) >= (uncompressed_size as f64) * threshold
+                        {
                             buffer.truncate(buffer_len);
                             buffer.extend_from_slice(&values_data.buf);
                             false
@@ -1154,10 +1159,6 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
         // Update total number of rows.
         self.column_metrics.total_rows_written += self.page_metrics.num_buffered_rows as u64;
-
-        // Reset state.
-        self.rep_levels_sink.clear();
-        self.def_levels_sink.clear();
         self.page_metrics.new_page();
 
         Ok(())
@@ -1232,23 +1233,6 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
         let metadata = builder.build()?;
         Ok(metadata)
-    }
-
-    /// Encodes definition or repetition levels for Data Page v1.
-    #[inline]
-    fn encode_levels_v1(&self, encoding: Encoding, levels: &[i16], max_level: i16) -> Vec<u8> {
-        let mut encoder = LevelEncoder::v1(encoding, max_level, levels.len());
-        encoder.put(levels);
-        encoder.consume()
-    }
-
-    /// Encodes definition or repetition levels for Data Page v2.
-    /// Encoding is always RLE.
-    #[inline]
-    fn encode_levels_v2(&self, levels: &[i16], max_level: i16) -> Vec<u8> {
-        let mut encoder = LevelEncoder::v2(max_level, levels.len());
-        encoder.put(levels);
-        encoder.consume()
     }
 
     /// Writes compressed data page into underlying sink and updates global metrics.
@@ -2440,6 +2424,55 @@ mod tests {
     }
 
     #[test]
+    fn test_column_writer_v2_compression_ratio_threshold() {
+        fn write_v2_page(threshold: f64) -> bool {
+            let mut buf = Vec::with_capacity(4096);
+            let mut write = TrackedWrite::new(&mut buf);
+            let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+            let props = Arc::new(
+                WriterProperties::builder()
+                    .set_writer_version(WriterVersion::PARQUET_2_0)
+                    .set_compression(Compression::SNAPPY)
+                    .set_dictionary_enabled(false)
+                    .set_data_page_v2_compression_ratio_threshold(threshold)
+                    .build(),
+            );
+
+            let mut writer = get_test_column_writer::<Int32Type>(page_writer, 0, 0, props);
+            let values: Vec<i32> = vec![42; 4096];
+            writer.write_batch(&values, None, None).unwrap();
+            let r = writer.close().unwrap();
+            drop(write);
+
+            let reader_props = ReaderProperties::builder()
+                .set_backward_compatible_lz4(false)
+                .build();
+            let reader = SerializedPageReader::new_with_properties(
+                Arc::new(Bytes::from(buf)),
+                &r.metadata,
+                r.rows_written as usize,
+                None,
+                Arc::new(reader_props),
+            )
+            .unwrap();
+            let pages = reader.collect::<Result<Vec<_>>>().unwrap();
+            let data_page = pages
+                .iter()
+                .find(|p| p.page_type() == PageType::DATA_PAGE_V2)
+                .expect("expected a v2 data page");
+            match data_page {
+                Page::DataPageV2 { is_compressed, .. } => *is_compressed,
+                _ => unreachable!(),
+            }
+        }
+
+        // Default threshold keeps the compressed buffer for constant data.
+        assert!(write_v2_page(1.0));
+        // A strict threshold (require >1000x reduction) discards it.
+        assert!(!write_v2_page(0.001));
+    }
+
+    #[test]
     fn test_column_writer_add_data_pages_with_dict() {
         // ARROW-5129: Test verifies that we add data page in case of dictionary encoding
         // and no fallback occurred so far.
@@ -2500,6 +2533,27 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn test_column_writer_column_data_page_size_limit() {
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_1_0)
+                .set_dictionary_enabled(false)
+                .set_data_page_size_limit(1000)
+                .set_column_data_page_size_limit(ColumnPath::from("col"), 10)
+                .set_write_batch_size(3)
+                .build(),
+        );
+        let data = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+        let col_values =
+            write_and_collect_page_values(ColumnPath::from("col"), Arc::clone(&props), data);
+        let other_values = write_and_collect_page_values(ColumnPath::from("other"), props, data);
+
+        assert_eq!(col_values, vec![3, 3, 3, 1]);
+        assert_eq!(other_values, vec![10]);
     }
 
     #[test]
@@ -4119,6 +4173,22 @@ mod tests {
         get_typed_column_writer::<T>(column_writer)
     }
 
+    fn get_test_column_writer_with_path<'a, T: DataType>(
+        page_writer: Box<dyn PageWriter + 'a>,
+        max_def_level: i16,
+        max_rep_level: i16,
+        props: WriterPropertiesPtr,
+        path: ColumnPath,
+    ) -> ColumnWriterImpl<'a, T> {
+        let descr = Arc::new(get_test_column_descr_with_path::<T>(
+            max_def_level,
+            max_rep_level,
+            path,
+        ));
+        let column_writer = get_column_writer(descr, props, page_writer);
+        get_typed_column_writer::<T>(column_writer)
+    }
+
     /// Returns column reader.
     fn get_test_column_reader<T: DataType>(
         page_reader: Box<dyn PageReader>,
@@ -4143,6 +4213,59 @@ mod tests {
             .build()
             .unwrap();
         ColumnDescriptor::new(Arc::new(tpe), max_def_level, max_rep_level, path)
+    }
+
+    fn get_test_column_descr_with_path<T: DataType>(
+        max_def_level: i16,
+        max_rep_level: i16,
+        path: ColumnPath,
+    ) -> ColumnDescriptor {
+        let name = path.string();
+        let tpe = SchemaType::primitive_type_builder(&name, T::get_physical_type())
+            // length is set for "encoding support" tests for FIXED_LEN_BYTE_ARRAY type,
+            // it should be no-op for other types
+            .with_length(1)
+            .build()
+            .unwrap();
+        ColumnDescriptor::new(Arc::new(tpe), max_def_level, max_rep_level, path)
+    }
+
+    fn write_and_collect_page_values(
+        path: ColumnPath,
+        props: WriterPropertiesPtr,
+        data: &[i32],
+    ) -> Vec<u32> {
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let mut writer =
+            get_test_column_writer_with_path::<Int32Type>(page_writer, 0, 0, props, path);
+        writer.write_batch(data, None, None).unwrap();
+        let r = writer.close().unwrap();
+
+        drop(write);
+
+        let props = ReaderProperties::builder()
+            .set_backward_compatible_lz4(false)
+            .build();
+        let mut page_reader = Box::new(
+            SerializedPageReader::new_with_properties(
+                Arc::new(file),
+                &r.metadata,
+                r.rows_written as usize,
+                None,
+                Arc::new(props),
+            )
+            .unwrap(),
+        );
+
+        let mut values_per_page = Vec::new();
+        while let Some(page) = page_reader.get_next_page().unwrap() {
+            assert_eq!(page.page_type(), PageType::DATA_PAGE);
+            values_per_page.push(page.num_values());
+        }
+
+        values_per_page
     }
 
     /// Returns page writer that collects pages without serializing them.

@@ -27,22 +27,19 @@ const LENGTH_OF_PREFIX_DATA: i64 = 8;
 /// In the case of zstd, this will contain the zstd context, which can be reused between subsequent
 /// compression calls to avoid the performance overhead of initialising a new context for every
 /// compression.
+#[derive(Default)]
 pub struct CompressionContext {
     #[cfg(feature = "zstd")]
-    compressor: zstd::bulk::Compressor<'static>,
+    compressor: Option<zstd::bulk::Compressor<'static>>,
 }
 
-// the reason we allow derivable_impls here is because when zstd feature is not enabled, this
-// becomes derivable. however with zstd feature want to be explicit about the compression level.
-#[allow(clippy::derivable_impls)]
-impl Default for CompressionContext {
-    fn default() -> Self {
-        CompressionContext {
-            // safety: `new` here will only return error here if using an invalid compression level
-            #[cfg(feature = "zstd")]
-            compressor: zstd::bulk::Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL)
-                .expect("can use default compression level"),
-        }
+impl CompressionContext {
+    #[cfg(feature = "zstd")]
+    fn zstd_compressor(&mut self) -> &mut zstd::bulk::Compressor<'static> {
+        self.compressor.get_or_insert_with(|| {
+            zstd::bulk::Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL)
+                .expect("can use default compression level")
+        })
     }
 }
 
@@ -51,7 +48,60 @@ impl std::fmt::Debug for CompressionContext {
         let mut ds = f.debug_struct("CompressionContext");
 
         #[cfg(feature = "zstd")]
-        ds.field("compressor", &"zstd::bulk::Compressor");
+        ds.field(
+            "compressor",
+            &self.compressor.as_ref().map(|_| "zstd::bulk::Compressor"),
+        );
+
+        ds.finish()
+    }
+}
+
+/// Additional context that may be needed for decompression.
+///
+/// In the case of zstd, this will contain the zstd decompression context, which can be reused
+/// between subsequent decompression calls to avoid the performance overhead of initialising a new
+/// context for every decompression.
+pub struct DecompressionContext {
+    #[cfg(feature = "zstd")]
+    decompressor: Option<zstd::bulk::Decompressor<'static>>,
+}
+
+impl DecompressionContext {
+    pub(crate) fn new() -> Self {
+        Default::default()
+    }
+
+    #[cfg(feature = "zstd")]
+    fn zstd_decompressor(&mut self) -> &mut zstd::bulk::Decompressor<'static> {
+        self.decompressor.get_or_insert_with(|| {
+            zstd::bulk::Decompressor::new().expect("can create zstd decompressor")
+        })
+    }
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for DecompressionContext {
+    fn default() -> Self {
+        DecompressionContext {
+            #[cfg(feature = "zstd")]
+            decompressor: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for DecompressionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ds = f.debug_struct("DecompressionContext");
+
+        #[cfg(feature = "zstd")]
+        ds.field(
+            "decompressor",
+            &self
+                .decompressor
+                .as_ref()
+                .map(|_| "zstd::bulk::Decompressor"),
+        );
 
         ds.finish()
     }
@@ -126,10 +176,14 @@ impl CompressionCodec {
     /// [8 bytes]:         uncompressed length
     /// [remaining bytes]: compressed data stream
     /// ```
-    pub(crate) fn decompress_to_buffer(&self, input: &Buffer) -> Result<Buffer, ArrowError> {
+    pub(crate) fn decompress_to_buffer(
+        &self,
+        input: &Buffer,
+        context: &mut DecompressionContext,
+    ) -> Result<Buffer, ArrowError> {
         // read the first 8 bytes to determine if the data is
         // compressed
-        let decompressed_length = read_uncompressed_size(input);
+        let decompressed_length = read_uncompressed_size(input)?;
         let buffer = if decompressed_length == 0 {
             // empty
             Buffer::from([])
@@ -139,7 +193,7 @@ impl CompressionCodec {
         } else if let Ok(decompressed_length) = usize::try_from(decompressed_length) {
             // decompress data using the codec
             let input_data = &input[(LENGTH_OF_PREFIX_DATA as usize)..];
-            let v = self.decompress(input_data, decompressed_length as _)?;
+            let v = self.decompress(input_data, decompressed_length as _, context)?;
             Buffer::from_vec(v)
         } else {
             return Err(ArrowError::IpcError(format!(
@@ -165,10 +219,15 @@ impl CompressionCodec {
 
     /// Decompress the data in input buffer and write to output buffer
     /// using the specified compression
-    fn decompress(&self, input: &[u8], decompressed_size: usize) -> Result<Vec<u8>, ArrowError> {
+    fn decompress(
+        &self,
+        input: &[u8],
+        decompressed_size: usize,
+        context: &mut DecompressionContext,
+    ) -> Result<Vec<u8>, ArrowError> {
         let ret = match self {
             CompressionCodec::Lz4Frame => decompress_lz4(input, decompressed_size)?,
-            CompressionCodec::Zstd => decompress_zstd(input, decompressed_size)?,
+            CompressionCodec::Zstd => decompress_zstd(input, decompressed_size, context)?,
         };
         if ret.len() != decompressed_size {
             return Err(ArrowError::IpcError(format!(
@@ -221,7 +280,7 @@ fn compress_zstd(
     output: &mut Vec<u8>,
     context: &mut CompressionContext,
 ) -> Result<(), ArrowError> {
-    let result = context.compressor.compress(input)?;
+    let result = context.zstd_compressor().compress(input)?;
     output.extend_from_slice(&result);
     Ok(())
 }
@@ -239,16 +298,24 @@ fn compress_zstd(
 }
 
 #[cfg(feature = "zstd")]
-fn decompress_zstd(input: &[u8], decompressed_size: usize) -> Result<Vec<u8>, ArrowError> {
-    use std::io::Read;
-    let mut output = Vec::with_capacity(decompressed_size);
-    zstd::Decoder::with_buffer(input)?.read_to_end(&mut output)?;
+fn decompress_zstd(
+    input: &[u8],
+    decompressed_size: usize,
+    context: &mut DecompressionContext,
+) -> Result<Vec<u8>, ArrowError> {
+    let output = context
+        .zstd_decompressor()
+        .decompress(input, decompressed_size)?;
     Ok(output)
 }
 
 #[cfg(not(feature = "zstd"))]
 #[allow(clippy::ptr_arg)]
-fn decompress_zstd(_input: &[u8], _decompressed_size: usize) -> Result<Vec<u8>, ArrowError> {
+fn decompress_zstd(
+    _input: &[u8],
+    _decompressed_size: usize,
+    _context: &mut DecompressionContext,
+) -> Result<Vec<u8>, ArrowError> {
     Err(ArrowError::InvalidArgumentError(
         "zstd IPC decompression requires the zstd feature".to_string(),
     ))
@@ -259,11 +326,16 @@ fn decompress_zstd(_input: &[u8], _decompressed_size: usize) -> Result<Vec<u8>, 
 ///   LENGTH_NO_COMPRESSED_DATA: indicate that the data that follows is not compressed
 ///    0: indicate that there is no data
 ///   positive number: indicate the uncompressed length for the following data
+/// Returns an error if the input buffer is shorter than 8 bytes
 #[inline]
-fn read_uncompressed_size(buffer: &[u8]) -> i64 {
-    let len_buffer = &buffer[0..8];
-    // 64-bit little-endian signed integer
-    i64::from_le_bytes(len_buffer.try_into().unwrap())
+fn read_uncompressed_size(buffer: &[u8]) -> Result<i64, ArrowError> {
+    let len_buffer = buffer.get(..LENGTH_OF_PREFIX_DATA as usize).ok_or_else(|| {
+        ArrowError::IpcError(format!(
+            "Compressed IPC buffer is too short: expected at least {LENGTH_OF_PREFIX_DATA} bytes, got {}",
+            buffer.len()
+        ))
+    })?;
+    Ok(i64::from_le_bytes(len_buffer.try_into().unwrap()))
 }
 
 #[cfg(test)]
@@ -278,7 +350,11 @@ mod tests {
             .compress(input_bytes, &mut output_bytes, &mut Default::default())
             .unwrap();
         let result = codec
-            .decompress(output_bytes.as_slice(), input_bytes.len())
+            .decompress(
+                output_bytes.as_slice(),
+                input_bytes.len(),
+                &mut Default::default(),
+            )
             .unwrap();
         assert_eq!(input_bytes, result.as_slice());
     }
@@ -293,8 +369,24 @@ mod tests {
             .compress(input_bytes, &mut output_bytes, &mut Default::default())
             .unwrap();
         let result = codec
-            .decompress(output_bytes.as_slice(), input_bytes.len())
+            .decompress(
+                output_bytes.as_slice(),
+                input_bytes.len(),
+                &mut Default::default(),
+            )
             .unwrap();
         assert_eq!(input_bytes, result.as_slice());
+    }
+
+    #[test]
+    fn test_read_uncompressed_size_rejects_short_prefix() {
+        let err = super::read_uncompressed_size(&[1, 2, 3, 4, 5, 6, 7])
+            .expect_err("short compressed IPC prefix should return an error");
+
+        assert!(
+            err.to_string()
+                .contains("Compressed IPC buffer is too short"),
+            "unexpected error: {err}"
+        );
     }
 }

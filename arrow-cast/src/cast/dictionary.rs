@@ -272,6 +272,19 @@ pub(crate) fn cast_to_dictionary<K: ArrowDictionaryKeyType>(
             }
             pack_byte_to_dictionary::<K, GenericStringType<i64>>(array, cast_options)
         }
+        Utf8View => {
+            let base_value_type = match array.data_type() {
+                DataType::LargeUtf8 | DataType::Utf8View => DataType::LargeUtf8,
+                _ => DataType::Utf8,
+            };
+
+            let dict_base = cast_to_dictionary::<K>(array, &base_value_type, cast_options)?;
+            dictionary_cast::<K>(
+                dict_base.as_ref(),
+                &DataType::Dictionary(Box::new(K::DATA_TYPE), Box::new(DataType::Utf8View)),
+                cast_options,
+            )
+        }
         Binary => {
             // If the input is a view type, we can avoid casting (thus copying) the data
             if array.data_type() == &DataType::BinaryView {
@@ -285,6 +298,19 @@ pub(crate) fn cast_to_dictionary<K: ArrowDictionaryKeyType>(
                 return binary_view_to_dictionary::<K, i64>(array);
             }
             pack_byte_to_dictionary::<K, GenericBinaryType<i64>>(array, cast_options)
+        }
+        BinaryView => {
+            let base_value_type = match array.data_type() {
+                DataType::LargeBinary | DataType::BinaryView => DataType::LargeBinary,
+                _ => DataType::Binary,
+            };
+
+            let dict_base = cast_to_dictionary::<K>(array, &base_value_type, cast_options)?;
+            dictionary_cast::<K>(
+                dict_base.as_ref(),
+                &DataType::Dictionary(Box::new(K::DATA_TYPE), Box::new(DataType::BinaryView)),
+                cast_options,
+            )
         }
         FixedSizeBinary(byte_size) => {
             pack_byte_to_fixed_size_dictionary::<K>(array, cast_options, byte_size)
@@ -335,22 +361,18 @@ where
     D: DecimalType + ArrowPrimitiveType,
 {
     let dict = pack_numeric_to_dictionary::<K, D>(array, dict_value_type, cast_options)?;
-    let dict = dict
-        .as_dictionary::<K>()
-        .downcast_dict::<PrimitiveArray<D>>()
-        .ok_or_else(|| {
-            ArrowError::ComputeError(format!(
-                "Internal Error: Cannot cast dict to {}Array",
-                D::PREFIX
-            ))
-        })?;
-    let value = dict.values().clone();
-    // Set correct precision/scale
-    let value = value.with_precision_and_scale(precision, scale)?;
-    Ok(Arc::new(DictionaryArray::<K>::try_new(
-        dict.keys().clone(),
-        Arc::new(value),
-    )?))
+    let dict = dict.as_dictionary::<K>();
+    let typed = dict.downcast_dict::<PrimitiveArray<D>>().ok_or_else(|| {
+        ArrowError::ComputeError(format!(
+            "Internal Error: Cannot cast dict to {}Array",
+            D::PREFIX
+        ))
+    })?;
+    let value = typed
+        .values()
+        .clone()
+        .with_precision_and_scale(precision, scale)?;
+    Ok(Arc::new(dict.with_values(Arc::new(value))))
 }
 
 pub(crate) fn string_view_to_dictionary<K, O: OffsetSizeTrait>(

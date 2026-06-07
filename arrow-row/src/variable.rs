@@ -45,21 +45,27 @@ pub const EMPTY_SENTINEL: u8 = 1;
 /// Indicates a non-empty string
 pub const NON_EMPTY_SENTINEL: u8 = 2;
 
-/// Returns the length of the encoded representation of a byte array, including the null byte
-#[inline]
-pub fn encoded_len(a: Option<&[u8]>) -> usize {
-    padded_length(a.map(|x| x.len()))
-}
+/// Indicates a Null value (for DataType::Null)
+pub const NULL_VALUE_SENTINEL: u8 = 3;
 
 /// Returns the padded length of the encoded length of the given length
 #[inline]
 pub fn padded_length(a: Option<usize>) -> usize {
     match a {
-        Some(a) if a <= BLOCK_SIZE => 1 + ceil(a, MINI_BLOCK_SIZE) * (MINI_BLOCK_SIZE + 1),
+        Some(a) => non_null_padded_length(a),
+        None => 1,
+    }
+}
+
+/// Returns the padded length of the encoded length of the given length
+#[inline]
+pub(crate) fn non_null_padded_length(len: usize) -> usize {
+    if len <= BLOCK_SIZE {
+        1 + ceil(len, MINI_BLOCK_SIZE) * (MINI_BLOCK_SIZE + 1)
+    } else {
         // Each miniblock ends with a 1 byte continuation, therefore add
         // `(MINI_BLOCK_COUNT - 1)` additional bytes over non-miniblock size
-        Some(a) => MINI_BLOCK_COUNT + ceil(a, BLOCK_SIZE) * (BLOCK_SIZE + 1),
-        None => 1,
+        MINI_BLOCK_COUNT + ceil(len, BLOCK_SIZE) * (BLOCK_SIZE + 1)
     }
 }
 
@@ -138,6 +144,19 @@ pub fn encode_empty(out: &mut [u8], opts: SortOptions) -> usize {
         false => EMPTY_SENTINEL,
     };
     1
+}
+
+/// Ensure `NullArray`s don't get encoded as empty lists which can lose their length
+pub fn encode_null_value(out: &mut [u8], opts: SortOptions) -> usize {
+    out[0] = match opts.descending {
+        true => !NON_EMPTY_SENTINEL,
+        false => NON_EMPTY_SENTINEL,
+    };
+    out[1] = match opts.descending {
+        true => !NULL_VALUE_SENTINEL,
+        false => NULL_VALUE_SENTINEL,
+    };
+    2
 }
 
 #[inline]
@@ -417,4 +436,16 @@ pub unsafe fn decode_string_view(
 ) -> StringViewArray {
     let view = decode_binary_view_inner(rows, options, validate_utf8);
     unsafe { view.to_string_view_unchecked() }
+}
+
+pub fn decode_null_value(rows: &mut [&[u8]], options: SortOptions) {
+    for row in rows.iter_mut() {
+        let (sentinel1, sentinel2) = match options.descending {
+            true => (!NON_EMPTY_SENTINEL, !NULL_VALUE_SENTINEL),
+            false => (NON_EMPTY_SENTINEL, NULL_VALUE_SENTINEL),
+        };
+        debug_assert_eq!(row[0], sentinel1, "Expected NULL_VALUE_SENTINEL at byte 0");
+        debug_assert_eq!(row[1], sentinel2, "Expected NULL_VALUE_SENTINEL at byte 1");
+        *row = &row[2..];
+    }
 }

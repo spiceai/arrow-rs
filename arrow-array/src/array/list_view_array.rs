@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_buffer::{NullBuffer, ScalarBuffer};
+use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::{ArrowError, DataType, FieldRef};
 use std::any::Any;
@@ -223,6 +223,35 @@ impl<OffsetSize: OffsetSizeTrait> GenericListViewArray<OffsetSize> {
         Self::try_new(field, offsets, sizes, values, nulls).unwrap()
     }
 
+    /// Create a new [`GenericListViewArray`] from the provided parts without validation
+    ///
+    /// See [`Self::try_new`] for the checked version of this function, and the
+    /// documentation of that function for the invariants that must be upheld.
+    ///
+    /// # Safety
+    ///
+    /// The parts must form a valid [`ListViewArray`] or [`LargeListViewArray`] according
+    /// to the Arrow spec.
+    pub unsafe fn new_unchecked(
+        field: FieldRef,
+        offsets: ScalarBuffer<OffsetSize>,
+        sizes: ScalarBuffer<OffsetSize>,
+        values: ArrayRef,
+        nulls: Option<NullBuffer>,
+    ) -> Self {
+        if cfg!(feature = "force_validate") {
+            return Self::new(field, offsets, sizes, values, nulls);
+        }
+
+        Self {
+            data_type: Self::DATA_TYPE_CONSTRUCTOR(field),
+            nulls,
+            values,
+            value_offsets: offsets,
+            value_sizes: sizes,
+        }
+    }
+
     /// Create a new [`GenericListViewArray`] of length `len` where all values are null
     pub fn new_null(field: FieldRef, len: usize) -> Self {
         let values = new_empty_array(field.data_type());
@@ -415,9 +444,8 @@ impl<OffsetSize: OffsetSizeTrait> ArrayAccessor for &GenericListViewArray<Offset
     }
 }
 
-impl<OffsetSize: OffsetSizeTrait> super::private::Sealed for GenericListViewArray<OffsetSize> {}
-
-impl<OffsetSize: OffsetSizeTrait> Array for GenericListViewArray<OffsetSize> {
+/// SAFETY: Correctly implements the contract of Arrow Arrays
+unsafe impl<OffsetSize: OffsetSizeTrait> Array for GenericListViewArray<OffsetSize> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -486,6 +514,28 @@ impl<OffsetSize: OffsetSizeTrait> Array for GenericListViewArray<OffsetSize> {
             size += n.buffer().capacity();
         }
         size
+    }
+
+    #[cfg(feature = "pool")]
+    fn claim(&self, pool: &dyn arrow_buffer::MemoryPool) {
+        self.value_offsets.claim(pool);
+        self.value_sizes.claim(pool);
+        self.values.claim(pool);
+        if let Some(nulls) = &self.nulls {
+            nulls.claim(pool);
+        }
+    }
+}
+
+impl<OffsetSize: OffsetSizeTrait> super::ListLikeArray for GenericListViewArray<OffsetSize> {
+    fn values(&self) -> &ArrayRef {
+        self.values()
+    }
+
+    fn element_range(&self, index: usize) -> std::ops::Range<usize> {
+        let offset = self.value_offsets()[index].as_usize();
+        let size = self.value_sizes()[index].as_usize();
+        offset..(offset + size)
     }
 }
 
@@ -576,23 +626,25 @@ impl<OffsetSize: OffsetSizeTrait> From<FixedSizeListArray> for GenericListViewAr
 
 impl<OffsetSize: OffsetSizeTrait> GenericListViewArray<OffsetSize> {
     fn try_new_from_array_data(data: ArrayData) -> Result<Self, ArrowError> {
-        if data.buffers().len() != 2 {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "ListViewArray data should contain two buffers (value offsets & value sizes), had {}",
-                data.buffers().len()
-            )));
-        }
+        let (data_type, len, nulls, offset, buffers, child_data) = data.into_parts();
 
-        if data.child_data().len() != 1 {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "ListViewArray should contain a single child array (values array), had {}",
-                data.child_data().len()
-            )));
-        }
+        // ArrayData is valid, and verified type above
+        // buffer[0] is offsets, buffer[1] is sizes
+        let num_buffers = buffers.len();
+        let [offsets_buffer, sizes_buffer] : [Buffer; 2] = buffers.try_into().map_err(|_| {
+             ArrowError::InvalidArgumentError(format!(
+                "ListViewArray data should contain two buffers (value offsets & value sizes), had {num_buffers}",
+            ))
+        })?;
 
-        let values = data.child_data()[0].clone();
+        let num_child = child_data.len();
+        let [values]: [ArrayData; 1] = child_data.try_into().map_err(|_| {
+            ArrowError::InvalidArgumentError(format!(
+                "ListViewArray should contain a single child array (values array), had {num_child}",
+            ))
+        })?;
 
-        if let Some(child_data_type) = Self::get_type(data.data_type()) {
+        if let Some(child_data_type) = Self::get_type(&data_type) {
             if values.data_type() != child_data_type {
                 return Err(ArrowError::InvalidArgumentError(format!(
                     "{}ListViewArray's child datatype {:?} does not \
@@ -607,18 +659,17 @@ impl<OffsetSize: OffsetSizeTrait> GenericListViewArray<OffsetSize> {
                 "{}ListViewArray's datatype must be {}ListViewArray(). It is {:?}",
                 OffsetSize::PREFIX,
                 OffsetSize::PREFIX,
-                data.data_type()
+                data_type
             )));
         }
 
         let values = make_array(values);
-        // ArrayData is valid, and verified type above
-        let value_offsets = ScalarBuffer::new(data.buffers()[0].clone(), data.offset(), data.len());
-        let value_sizes = ScalarBuffer::new(data.buffers()[1].clone(), data.offset(), data.len());
+        let value_offsets = ScalarBuffer::new(offsets_buffer, offset, len);
+        let value_sizes = ScalarBuffer::new(sizes_buffer, offset, len);
 
         Ok(Self {
-            data_type: data.data_type().clone(),
-            nulls: data.nulls().cloned(),
+            data_type,
+            nulls,
             values,
             value_offsets,
             value_sizes,

@@ -24,6 +24,7 @@ use crate::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataRea
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectMeta};
 use tokio::runtime::Handle;
@@ -43,7 +44,7 @@ pub enum ObjectVersionType {
 /// # use std::io::stdout;
 /// # use std::sync::Arc;
 /// # use object_store::azure::MicrosoftAzureBuilder;
-/// # use object_store::ObjectStore;
+/// # use object_store::{ObjectStore, ObjectStoreExt};
 /// # use object_store::path::Path;
 /// # use parquet::arrow::async_reader::ParquetObjectReader;
 /// # use parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -251,7 +252,7 @@ impl AsyncFileReader for ParquetObjectReader {
                     .and_then(|resp| resp.bytes())
                     .boxed()
             } else {
-                store.get_range(&meta.location, range)
+                store.get_range(&meta.location, range).boxed()
             }
         })
     }
@@ -318,12 +319,15 @@ impl AsyncFileReader for ParquetObjectReader {
             }
 
             // Override page index policies from ArrowReaderOptions if specified and not Skip.
-            // When page_index_policy is Skip (default), use the reader's preload flags.
-            // When page_index_policy is Optional or Required, override the preload flags
-            // to ensure the specified policy takes precedence.
+            // Upstream split the single page-index policy into independent column-index and
+            // offset-index policies; honor each so a caller-specified policy takes precedence
+            // over the reader's preload flags. Skip (the default) leaves the preload flags intact.
             if let Some(options) = options {
-                if options.page_index_policy != PageIndexPolicy::Skip {
-                    metadata = metadata.with_page_index_policy(options.page_index_policy);
+                if options.column_index_policy() != PageIndexPolicy::Skip {
+                    metadata = metadata.with_column_index_policy(options.column_index_policy());
+                }
+                if options.offset_index_policy() != PageIndexPolicy::Skip {
+                    metadata = metadata.with_offset_index_policy(options.offset_index_policy());
                 }
             }
 
@@ -366,7 +370,7 @@ mod tests {
     use futures::FutureExt;
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
-    use object_store::{ObjectMeta, ObjectStore};
+    use object_store::{CopyOptions, ObjectMeta, ObjectStore, ObjectStoreExt};
 
     async fn get_meta_store() -> (ObjectMeta, Arc<dyn ObjectStore>) {
         let res = parquet_test_data();
@@ -433,8 +437,11 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
@@ -451,12 +458,13 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -589,14 +597,12 @@ mod tests {
         let (meta, store) = get_meta_store_with_page_index().await;
 
         // Create reader with preload flags set to true
-        let mut reader = ParquetObjectReader::new(store.clone(), meta.location.clone())
-            .with_file_size(meta.size)
+        let mut reader = ParquetObjectReader::new_with_meta(store.clone(), meta.clone())
             .with_preload_column_index(true)
             .with_preload_offset_index(true);
 
-        // Create options with page_index_policy set to Skip (default)
-        let mut options = ArrowReaderOptions::new();
-        options.page_index_policy = PageIndexPolicy::Skip;
+        // Create options with page index policy set to Skip (default)
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
 
         // Get metadata - Skip means use reader's preload flags (true)
         let metadata = reader.get_metadata(Some(&options)).await.unwrap();
@@ -610,14 +616,12 @@ mod tests {
         let (meta, store) = get_meta_store_with_page_index().await;
 
         // Create reader with preload flags set to false
-        let mut reader = ParquetObjectReader::new(store.clone(), meta.location.clone())
-            .with_file_size(meta.size)
+        let mut reader = ParquetObjectReader::new_with_meta(store.clone(), meta.clone())
             .with_preload_column_index(false)
             .with_preload_offset_index(false);
 
-        // Create options with page_index_policy set to Optional
-        let mut options = ArrowReaderOptions::new();
-        options.page_index_policy = PageIndexPolicy::Optional;
+        // Create options with page index policy set to Optional
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
 
         // Get metadata - Optional overrides preload flags and attempts to load indexes
         let metadata = reader.get_metadata(Some(&options)).await.unwrap();
@@ -632,23 +636,19 @@ mod tests {
         let (meta, store) = get_meta_store_with_page_index().await;
 
         // Test 1: preload=false + Skip policy -> uses preload flags (false)
-        let mut reader1 = ParquetObjectReader::new(store.clone(), meta.location.clone())
-            .with_file_size(meta.size)
+        let mut reader1 = ParquetObjectReader::new_with_meta(store.clone(), meta.clone())
             .with_preload_column_index(false)
             .with_preload_offset_index(false);
 
-        let mut options1 = ArrowReaderOptions::new();
-        options1.page_index_policy = PageIndexPolicy::Skip;
+        let options1 = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
         let metadata1 = reader1.get_metadata(Some(&options1)).await.unwrap();
 
         // Test 2: preload=false + Optional policy -> overrides to try loading
-        let mut reader2 = ParquetObjectReader::new(store.clone(), meta.location.clone())
-            .with_file_size(meta.size)
+        let mut reader2 = ParquetObjectReader::new_with_meta(store.clone(), meta.clone())
             .with_preload_column_index(false)
             .with_preload_offset_index(false);
 
-        let mut options2 = ArrowReaderOptions::new();
-        options2.page_index_policy = PageIndexPolicy::Optional;
+        let options2 = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
         let metadata2 = reader2.get_metadata(Some(&options2)).await.unwrap();
 
         // Both should succeed (no panic/error)
@@ -663,8 +663,7 @@ mod tests {
         let (meta, store) = get_meta_store_with_page_index().await;
 
         // Create reader with preload flags set to true
-        let mut reader = ParquetObjectReader::new(store, meta.location)
-            .with_file_size(meta.size)
+        let mut reader = ParquetObjectReader::new_with_meta(store, meta)
             .with_preload_column_index(true)
             .with_preload_offset_index(true);
 
