@@ -172,11 +172,7 @@ where
             .map_err(|_| ArrowError::ParseError("Cannot parse header".to_string()))?;
         req.metadata_mut().insert("authorization", val);
         let req = self.set_request_headers(req)?;
-        let resp = self
-            .flight_client
-            .handshake(req)
-            .await
-            .map_err(|e| ArrowError::IpcError(format!("Can't handshake {e}")))?;
+        let resp = self.flight_client.handshake(req).await?;
         if let Some(auth) = resp.metadata().get("authorization") {
             let auth = auth
                 .to_str()
@@ -188,11 +184,7 @@ where
             let auth = auth[bearer.len()..].to_string();
             self.token = Some(auth);
         }
-        let responses: Vec<HandshakeResponse> = resp
-            .into_inner()
-            .try_collect()
-            .await
-            .map_err(|_| ArrowError::ParseError("Can't collect responses".to_string()))?;
+        let responses: Vec<HandshakeResponse> = resp.into_inner().try_collect().await?;
         let resp = match responses.as_slice() {
             [resp] => resp.payload.clone(),
             [] => Bytes::new(),

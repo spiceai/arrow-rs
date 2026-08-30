@@ -32,13 +32,14 @@ use arrow_flight::sql::{
     CommandStatementIngest, EndTransaction, FallibleRequestStream, ProstMessageExt, SqlInfo,
     TableDefinitionOptions, TableExistsOption, TableNotExistOption,
 };
-use arrow_flight::{Action, FlightData, FlightDescriptor};
-use futures::{StreamExt, TryStreamExt};
+use arrow_flight::{Action, FlightData, FlightDescriptor, HandshakeRequest, HandshakeResponse};
+use futures::{Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tonic::{IntoStreamingRequest, Request, Status};
+use tonic::{Code, IntoStreamingRequest, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -204,6 +205,99 @@ pub async fn test_do_put_missing_flight_descriptor() {
         err.to_string()
             .contains("Unhandled Error: Flight descriptor is missing."),
     );
+}
+
+#[tokio::test]
+pub async fn test_handshake_error_preserves_tonic_status() {
+    let fixture = TestFixture::new(HandshakeTestServer::service(HandshakeFailure::Rpc)).await;
+    let channel = fixture.channel().await;
+    let mut flight_sql_client = FlightSqlServiceClient::new(channel);
+
+    let err = flight_sql_client
+        .handshake("user", "pass")
+        .await
+        .unwrap_err();
+
+    assert_reset_status(err);
+}
+
+#[tokio::test]
+pub async fn test_handshake_response_stream_error_preserves_tonic_status() {
+    let fixture = TestFixture::new(HandshakeTestServer::service(
+        HandshakeFailure::ResponseStream,
+    ))
+    .await;
+    let channel = fixture.channel().await;
+    let mut flight_sql_client = FlightSqlServiceClient::new(channel);
+
+    let err = flight_sql_client
+        .handshake("user", "pass")
+        .await
+        .unwrap_err();
+
+    assert_reset_status(err);
+}
+
+/// Callers classify a failed handshake by inspecting the server's [`Status`],
+/// so it must reach them typed rather than rendered into text.
+fn assert_reset_status(err: FlightError) {
+    let FlightError::Tonic(status) = &err else {
+        panic!("expected FlightError::Tonic, got {err:?}");
+    };
+    assert_eq!(status.code(), Code::Unknown);
+    assert_eq!(status.message(), "transport error");
+}
+
+/// The status a reset upstream connection surfaces as.
+fn reset_status() -> Status {
+    Status::new(Code::Unknown, "transport error")
+}
+
+/// Which of the two handshake failure paths the server should exercise.
+#[derive(Clone, Copy)]
+enum HandshakeFailure {
+    /// The RPC itself fails.
+    Rpc,
+    /// The RPC succeeds and the response stream fails part way through.
+    ResponseStream,
+}
+
+#[derive(Clone)]
+struct HandshakeTestServer {
+    failure: HandshakeFailure,
+}
+
+impl HandshakeTestServer {
+    fn service(failure: HandshakeFailure) -> FlightServiceServer<Self> {
+        FlightServiceServer::new(Self { failure })
+    }
+}
+
+#[tonic::async_trait]
+impl FlightSqlService for HandshakeTestServer {
+    type FlightService = Self;
+
+    async fn do_handshake(
+        &self,
+        _request: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<
+        Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>,
+        Status,
+    > {
+        match self.failure {
+            HandshakeFailure::Rpc => Err(reset_status()),
+            // Yield one response first so the server commits to a success
+            // status before the stream fails.
+            HandshakeFailure::ResponseStream => {
+                Ok(Response::new(Box::pin(futures::stream::iter(vec![
+                    Ok(HandshakeResponse::default()),
+                    Err(reset_status()),
+                ]))))
+            }
+        }
+    }
+
+    async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
 }
 
 fn make_ingest_command() -> CommandStatementIngest {
