@@ -36,6 +36,7 @@ use arrow_flight::{Action, FlightData, FlightDescriptor, HandshakeRequest, Hands
 use futures::{Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use std::collections::HashMap;
+use std::error::Error;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -218,7 +219,7 @@ pub async fn test_handshake_error_preserves_tonic_status() {
         .await
         .unwrap_err();
 
-    assert_reset_status(err);
+    assert_reset_status(err, "Can't handshake");
 }
 
 #[tokio::test]
@@ -235,17 +236,43 @@ pub async fn test_handshake_response_stream_error_preserves_tonic_status() {
         .await
         .unwrap_err();
 
-    assert_reset_status(err);
+    assert_reset_status(err, "Can't collect handshake responses");
 }
 
-/// Callers classify a failed handshake by inspecting the server's [`Status`],
-/// so it must reach them typed rather than rendered into text.
-fn assert_reset_status(err: FlightError) {
-    let FlightError::Tonic(status) = &err else {
-        panic!("expected FlightError::Tonic, got {err:?}");
-    };
+/// A failed handshake has to carry both halves: the server's [`Status`], typed,
+/// so callers can classify it, and the context saying which call produced it.
+fn assert_reset_status(err: FlightError, expected_context: &str) {
+    let status = err
+        .tonic_status()
+        .unwrap_or_else(|| panic!("status should survive, got {err:?}"));
     assert_eq!(status.code(), Code::Unknown);
     assert_eq!(status.message(), "transport error");
+
+    // a caller that knows nothing of `FlightError` finds the same status by
+    // walking `Error::source`
+    assert_eq!(
+        walk_to_status(&err).map(Status::code),
+        Some(Code::Unknown),
+        "no tonic::Status in the source chain of {err:?}"
+    );
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.starts_with(expected_context),
+        "expected context {expected_context:?}, got {rendered:?}"
+    );
+}
+
+/// Find a [`Status`] in an error chain using only [`Error`].
+fn walk_to_status(err: &FlightError) -> Option<&Status> {
+    let mut current: Option<&(dyn Error + 'static)> = Some(err);
+    while let Some(err) = current {
+        if let Some(status) = err.downcast_ref::<Status>() {
+            return Some(status);
+        }
+        current = err.source();
+    }
+    None
 }
 
 /// The status a reset upstream connection surfaces as.
