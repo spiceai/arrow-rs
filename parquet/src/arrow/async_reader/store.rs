@@ -32,10 +32,33 @@ use tokio::runtime::Handle;
 /// Indicates the type of object versioning to use when retrieving objects from the object store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObjectVersionType {
-    /// Uses the ETag property of the object to retrieve the specific object
+    /// Pin every request with `If-Match` on the listed ETag.
     ETag,
-    /// Uses the Version property of the object to retrieve the specific object
+    /// Pin every request with the listed version id.
+    ///
+    /// When the listing did not carry a version id (unversioned buckets still
+    /// report an ETag), fall back to `If-Match` so a replacement still cannot
+    /// mix generations.
     Version,
+}
+
+/// `(if_match, version)` for a `GetOptions` pin.
+///
+/// A `Version` pin with no version id uses the listed ETag. Listings from
+/// unversioned buckets never carry a version id; without this fallback those
+/// reads are unpinned and a replacement mid-scan is decoded as a mixture.
+fn pin_for_object(
+    object_versioning_type: Option<&ObjectVersionType>,
+    meta: &ObjectMeta,
+) -> (Option<String>, Option<String>) {
+    match object_versioning_type {
+        Some(ObjectVersionType::ETag) => (meta.e_tag.clone(), None),
+        Some(ObjectVersionType::Version) => match meta.version.clone() {
+            Some(version) => (None, Some(version)),
+            None => (meta.e_tag.clone(), None),
+        },
+        None => (None, None),
+    }
 }
 
 /// Reads Parquet files in object storage using [`ObjectStore`].
@@ -116,6 +139,15 @@ impl ParquetObjectReader {
             runtime: None,
             object_versioning_type: Arc::new(None),
         }
+    }
+
+    /// Pin later fetches to this object version id.
+    ///
+    /// `ListObjectsV2` listings omit version ids. The listing-table reader
+    /// `HEAD`s once and calls this so page reads use `version=` rather than
+    /// `If-Match`.
+    pub fn set_object_version(&mut self, version: impl Into<String>) {
+        self.object_meta.version = Some(version.into());
     }
 
     /// Set the object versioning type to use when retrieving objects from the object store.
@@ -209,11 +241,10 @@ impl ParquetObjectReader {
 
 impl MetadataSuffixFetch for &mut ParquetObjectReader {
     fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, Result<Bytes>> {
-        let (if_match, version) = match self.object_versioning_type.as_ref().as_ref() {
-            Some(ObjectVersionType::ETag) => (self.object_meta.e_tag.clone(), None),
-            Some(ObjectVersionType::Version) => (None, self.object_meta.version.clone()),
-            None => (None, None),
-        };
+        let (if_match, version) = pin_for_object(
+            self.object_versioning_type.as_ref().as_ref(),
+            &self.object_meta,
+        );
         let options = GetOptions {
             range: Some(GetRange::Suffix(suffix as u64)),
             if_match,
@@ -235,11 +266,9 @@ impl AsyncFileReader for ParquetObjectReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
         let object_versioning_type = Arc::clone(&self.object_versioning_type);
         self.spawn(move |store, meta| {
-            if let Some(object_versioning_type) = object_versioning_type.as_ref() {
-                let (if_match, version) = match object_versioning_type {
-                    ObjectVersionType::ETag => (meta.e_tag.clone(), None),
-                    ObjectVersionType::Version => (None, meta.version.clone()),
-                };
+            let (if_match, version) =
+                pin_for_object(object_versioning_type.as_ref().as_ref(), meta);
+            if if_match.is_some() || version.is_some() {
                 let opts = GetOptions {
                     range: Some(GetRange::Bounded(range)),
                     if_match,
@@ -266,11 +295,8 @@ impl AsyncFileReader for ParquetObjectReader {
                 // versioned reads (ETag/Version pinning) when configured.
                 // See: https://github.com/apache/arrow-rs-object-store/blob/v0.12.0/src/lib.rs#L640
                 // (ObjectStore::get_ranges default impl)
-                let (if_match, version) = match object_versioning_type.as_ref() {
-                    Some(ObjectVersionType::ETag) => (meta.e_tag.clone(), None),
-                    Some(ObjectVersionType::Version) => (None, meta.version.clone()),
-                    None => (None, None),
-                };
+                let (if_match, version) =
+                    pin_for_object(object_versioning_type.as_ref().as_ref(), meta);
                 let location = &meta.location;
                 object_store::coalesce_ranges(
                     &ranges,
@@ -364,7 +390,7 @@ mod tests {
     use std::fmt::{self, Display, Formatter};
 
     use crate::arrow::ParquetRecordBatchStreamBuilder;
-    use crate::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+    use crate::arrow::async_reader::{AsyncFileReader, ObjectVersionType, ParquetObjectReader};
     use crate::errors::ParquetError;
     use arrow::util::test_util::parquet_test_data;
     use futures::FutureExt;
@@ -739,5 +765,142 @@ mod tests {
             fetch_count < 10,
             "Expected coalesced fetches < 10, but got {fetch_count}."
         );
+    }
+
+    /// Records the [`GetOptions`] of every read so a test can assert the pin.
+    #[derive(Debug)]
+    struct PinRecordingStore {
+        inner: InMemory,
+        reads: std::sync::Mutex<Vec<GetOptions>>,
+    }
+
+    impl Display for PinRecordingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "PinRecordingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PinRecordingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.reads.lock().expect("reads lock").push(options.clone());
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A `Version` pin with no version id must fall back to `If-Match` on the
+    /// listed ETag. Unversioned buckets never carry a version id; without the
+    /// fallback those reads are unpinned.
+    #[tokio::test]
+    async fn version_pin_falls_back_to_etag_when_listing_has_no_version_id() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as _],
+        )
+        .expect("batch");
+        let mut buf = Vec::new();
+        let mut writer =
+            crate::arrow::ArrowWriter::try_new(&mut buf, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let store = Arc::new(PinRecordingStore {
+            inner: InMemory::new(),
+            reads: std::sync::Mutex::new(Vec::new()),
+        });
+        let location = Path::from("unversioned.parquet");
+        store
+            .put(&location, PutPayload::from(buf))
+            .await
+            .expect("put");
+        let listed = store.head(&location).await.expect("head");
+        assert!(
+            listed.version.is_none(),
+            "this test needs a listing with no version id"
+        );
+        let etag = listed
+            .e_tag
+            .clone()
+            .expect("an unversioned listing still carries an ETag");
+        store.reads.lock().expect("reads lock").clear();
+
+        let reader =
+            ParquetObjectReader::new_with_meta(store.clone() as Arc<dyn ObjectStore>, listed)
+                .with_object_versioning_type(Some(ObjectVersionType::Version));
+        let batches: Vec<_> = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .expect("builder")
+            .build()
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("collect");
+        assert_eq!(batches[0].num_rows(), 3);
+
+        let reads = store.reads.lock().expect("reads lock").clone();
+        assert!(!reads.is_empty(), "the reader issued no request");
+        for options in &reads {
+            assert_eq!(
+                options.if_match.as_deref(),
+                Some(etag.as_str()),
+                "a Version pin with no version id must send If-Match: {options:?}"
+            );
+            assert!(
+                options.version.is_none(),
+                "must not invent a version id: {options:?}"
+            );
+        }
     }
 }
