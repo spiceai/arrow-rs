@@ -252,22 +252,25 @@ impl Buffer {
         self.data.deallocation()
     }
 
-    /// Whether this buffer's memory belongs to a foreign allocator — imported
-    /// over the Arrow C data interface rather than allocated by this process.
+    /// Whether this buffer's memory was allocated by something other than
+    /// [`std::alloc`] — an import over the Arrow C data interface, or a
+    /// [`bytes::Bytes`] — and is freed by that owner rather than by this buffer.
     ///
-    /// [`Self::capacity`] is not a trustworthy measure of such a buffer. For a
-    /// foreign allocation it reports the size the producer declared at import,
-    /// and the allocation actually behind the pointer may be larger; see the
-    /// note on `Bytes::capacity`. A buffer imported from a database driver, for
-    /// instance, may be a window onto a result chunk that the driver keeps
-    /// alive for as long as any importer holds a reference to it.
+    /// The reason to ask is [`Self::capacity`]. For a custom allocation it
+    /// returns the size recorded when the buffer was built, and the allocation
+    /// actually kept alive may be larger: an FFI import may be a window onto a
+    /// producer's result chunk, and a [`bytes::Bytes`] may be a slice of a
+    /// larger buffer that stays alive while any slice of it does.
     ///
-    /// This matters to a consumer that retains a buffer past the scan that
-    /// produced it — a cache, or an in-memory index. Such a consumer cannot
-    /// tell from [`Self::capacity`] how much memory it is pinning, and cannot
-    /// bound it, so it is generally better off copying the rows it keeps into
-    /// its own allocation than sharing the producer's.
-    pub fn is_foreign_owned(&self) -> bool {
+    /// That is fine for the memory-usage reporting `capacity` exists for, but
+    /// it means a consumer which *retains* a buffer past the scan that produced
+    /// it — a cache, or an in-memory index — cannot use `capacity` to bound
+    /// what it is pinning. Such a consumer is generally better off copying the
+    /// rows it keeps into its own allocation than sharing this one.
+    ///
+    /// This says nothing about *where* the memory came from beyond that: a
+    /// custom allocation may well have been made by this process.
+    pub fn has_custom_allocation(&self) -> bool {
         matches!(self.deallocation(), Deallocation::Custom(..))
     }
 
@@ -649,11 +652,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn foreign_owned_is_true_only_for_a_custom_allocation() {
+    fn custom_allocation_covers_every_non_standard_owner() {
         let native = Buffer::from_vec(vec![1_u8, 2, 3, 4]);
         assert!(
-            !native.is_foreign_owned(),
-            "a buffer this process allocated is not foreign owned"
+            !native.has_custom_allocation(),
+            "a buffer allocated through std::alloc is not a custom allocation"
         );
 
         // The shape an FFI import produces: a pointer whose memory is kept
@@ -663,16 +666,24 @@ mod tests {
         let imported = unsafe {
             Buffer::from_custom_allocation(ptr, backing.len(), backing.clone() as Arc<dyn Allocation>)
         };
+        assert!(imported.has_custom_allocation());
+
+        // A slice of one stays custom, which is the case that matters: slicing
+        // is how a small result is carved out of a big chunk.
         assert!(
-            imported.is_foreign_owned(),
-            "a buffer imported from a foreign allocator is foreign owned"
+            imported.slice(1).has_custom_allocation(),
+            "slicing must not lose track of who owns the allocation"
         );
 
-        // And a slice of one stays foreign owned, which is the case that
-        // matters: slicing is how a small result is carved out of a big chunk.
+        // And a `bytes::Bytes` allocated right here is custom too — the
+        // predicate is about who frees the memory, not about where it came
+        // from. It belongs on this side for the same reason: a `Bytes` may be a
+        // slice of a larger buffer, so its recorded length is not a bound on
+        // what it keeps alive.
+        let local = Buffer::from(bytes::Bytes::from(vec![1_u8, 2, 3, 4]));
         assert!(
-            imported.slice(1).is_foreign_owned(),
-            "slicing must not lose track of who owns the allocation"
+            local.has_custom_allocation(),
+            "a locally allocated bytes::Bytes is still freed by its own owner"
         );
     }
 
