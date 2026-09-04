@@ -252,6 +252,28 @@ impl Buffer {
         self.data.deallocation()
     }
 
+    /// Whether this buffer's memory was allocated by something other than
+    /// [`std::alloc`] — an import over the Arrow C data interface, or a
+    /// [`bytes::Bytes`] — and is freed by that owner rather than by this buffer.
+    ///
+    /// The reason to ask is [`Self::capacity`]. For a custom allocation it
+    /// returns the size recorded when the buffer was built, and the allocation
+    /// actually kept alive may be larger: an FFI import may be a window onto a
+    /// producer's result chunk, and a [`bytes::Bytes`] may be a slice of a
+    /// larger buffer that stays alive while any slice of it does.
+    ///
+    /// That is fine for the memory-usage reporting `capacity` exists for, but
+    /// it means a consumer which *retains* a buffer past the scan that produced
+    /// it — a cache, or an in-memory index — cannot use `capacity` to bound
+    /// what it is pinning. Such a consumer is generally better off copying the
+    /// rows it keeps into its own allocation than sharing this one.
+    ///
+    /// This says nothing about *where* the memory came from beyond that: a
+    /// custom allocation may well have been made by this process.
+    pub fn has_custom_allocation(&self) -> bool {
+        matches!(self.deallocation(), Deallocation::Custom(..))
+    }
+
     /// Returns a new [Buffer] that is a slice of this buffer starting at `offset`.
     ///
     /// This function is `O(1)` and does not copy any data, allowing the
@@ -628,6 +650,46 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn custom_allocation_covers_every_non_standard_owner() {
+        let native = Buffer::from_vec(vec![1_u8, 2, 3, 4]);
+        assert!(
+            !native.has_custom_allocation(),
+            "a buffer allocated through std::alloc is not a custom allocation"
+        );
+
+        // The shape an FFI import produces: a pointer whose memory is kept
+        // alive by an `Allocation` the producer owns.
+        let backing = Arc::new(vec![1_u8, 2, 3, 4]);
+        let ptr = NonNull::new(backing.as_ptr() as *mut u8).expect("non-null");
+        let imported = unsafe {
+            Buffer::from_custom_allocation(
+                ptr,
+                backing.len(),
+                backing.clone() as Arc<dyn Allocation>,
+            )
+        };
+        assert!(imported.has_custom_allocation());
+
+        // A slice of one stays custom, which is the case that matters: slicing
+        // is how a small result is carved out of a big chunk.
+        assert!(
+            imported.slice(1).has_custom_allocation(),
+            "slicing must not lose track of who owns the allocation"
+        );
+
+        // And a `bytes::Bytes` allocated right here is custom too — the
+        // predicate is about who frees the memory, not about where it came
+        // from. It belongs on this side for the same reason: a `Bytes` may be a
+        // slice of a larger buffer, so its recorded length is not a bound on
+        // what it keeps alive.
+        let local = Buffer::from(bytes::Bytes::from(vec![1_u8, 2, 3, 4]));
+        assert!(
+            local.has_custom_allocation(),
+            "a locally allocated bytes::Bytes is still freed by its own owner"
+        );
+    }
 
     #[test]
     fn test_buffer_data_equality() {
