@@ -252,6 +252,25 @@ impl Buffer {
         self.data.deallocation()
     }
 
+    /// Whether this buffer's memory belongs to a foreign allocator — imported
+    /// over the Arrow C data interface rather than allocated by this process.
+    ///
+    /// [`Self::capacity`] is not a trustworthy measure of such a buffer. For a
+    /// foreign allocation it reports the size the producer declared at import,
+    /// and the allocation actually behind the pointer may be larger; see the
+    /// note on `Bytes::capacity`. A buffer imported from a database driver, for
+    /// instance, may be a window onto a result chunk that the driver keeps
+    /// alive for as long as any importer holds a reference to it.
+    ///
+    /// This matters to a consumer that retains a buffer past the scan that
+    /// produced it — a cache, or an in-memory index. Such a consumer cannot
+    /// tell from [`Self::capacity`] how much memory it is pinning, and cannot
+    /// bound it, so it is generally better off copying the rows it keeps into
+    /// its own allocation than sharing the producer's.
+    pub fn is_foreign_owned(&self) -> bool {
+        matches!(self.deallocation(), Deallocation::Custom(..))
+    }
+
     /// Returns a new [Buffer] that is a slice of this buffer starting at `offset`.
     ///
     /// This function is `O(1)` and does not copy any data, allowing the
@@ -628,6 +647,35 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn foreign_owned_is_true_only_for_a_custom_allocation() {
+        let native = Buffer::from_vec(vec![1_u8, 2, 3, 4]);
+        assert!(
+            !native.is_foreign_owned(),
+            "a buffer this process allocated is not foreign owned"
+        );
+
+        // The shape an FFI import produces: a pointer whose memory is kept
+        // alive by an `Allocation` the producer owns.
+        let backing = Arc::new(vec![1_u8, 2, 3, 4]);
+        let ptr = NonNull::new(backing.as_ptr() as *mut u8).expect("non-null");
+        let imported = unsafe {
+            Buffer::from_custom_allocation(ptr, backing.len(), backing.clone() as Arc<dyn Allocation>)
+        };
+        assert!(
+            imported.is_foreign_owned(),
+            "a buffer imported from a foreign allocator is foreign owned"
+        );
+
+        // And a slice of one stays foreign owned, which is the case that
+        // matters: slicing is how a small result is carved out of a big chunk.
+        assert!(
+            imported.slice(1).is_foreign_owned(),
+            "slicing must not lose track of who owns the allocation"
+        );
+    }
+
 
     #[test]
     fn test_buffer_data_equality() {
