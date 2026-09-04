@@ -664,7 +664,11 @@ mod tests {
         let backing = Arc::new(vec![1_u8, 2, 3, 4]);
         let ptr = NonNull::new(backing.as_ptr() as *mut u8).expect("non-null");
         let imported = unsafe {
-            Buffer::from_custom_allocation(ptr, backing.len(), backing.clone() as Arc<dyn Allocation>)
+            Buffer::from_custom_allocation(
+                ptr,
+                backing.len(),
+                backing.clone() as Arc<dyn Allocation>,
+            )
         };
         assert!(imported.has_custom_allocation());
 
@@ -686,7 +690,6 @@ mod tests {
             "a locally allocated bytes::Bytes is still freed by its own owner"
         );
     }
-
 
     #[test]
     fn test_buffer_data_equality() {
