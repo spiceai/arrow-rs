@@ -2299,7 +2299,7 @@ fn cast_from_decimal<D, F>(
 ) -> Result<ArrayRef, ArrowError>
 where
     D: DecimalType + ArrowPrimitiveType,
-    <D as ArrowPrimitiveType>::Native: ToPrimitive,
+    <D as ArrowPrimitiveType>::Native: ToPrimitive + std::fmt::Display,
     F: Fn(D::Native) -> f64,
 {
     use DataType::*;
@@ -2314,10 +2314,10 @@ where
         Int32 => cast_decimal_to_integer::<D, Int32Type>(array, base, *scale, cast_options),
         Int64 => cast_decimal_to_integer::<D, Int64Type>(array, base, *scale, cast_options),
         Float32 => cast_decimal_to_float::<D, Float32Type, _>(array, |x| {
-            (as_float(x) / 10_f64.powi(*scale as i32)) as f32
+            decimal_native_to_f32(&as_float, x, *scale)
         }),
         Float64 => cast_decimal_to_float::<D, Float64Type, _>(array, |x| {
-            as_float(x) / 10_f64.powi(*scale as i32)
+            decimal_native_to_f64(&as_float, x, *scale)
         }),
         Utf8View => value_to_string_view(array, cast_options),
         Utf8 => value_to_string::<i32>(array, cast_options),
@@ -2326,6 +2326,87 @@ where
         _ => Err(ArrowError::CastError(format!(
             "Casting from {from_type} to {to_type} not supported"
         ))),
+    }
+}
+
+/// Correctly-rounded conversion of a decimal coefficient `x` at `scale` decimal
+/// places to `f64`.
+///
+/// The straightforward `(x as f64) / 10^scale` widens the coefficient to `f64`
+/// *before* dividing, so a coefficient that is not exactly representable in `f64`
+/// (possible once its magnitude exceeds `2^53`) is rounded on the way in and the
+/// divide carries that error through, landing the result up to a couple of ULP off
+/// the true value (see <https://github.com/spiceai/spiceai/issues/13978>).
+///
+/// Fast path: when the coefficient is exactly representable (`|x| < 2^53`) and
+/// `10^scale` is exact (`0 <= scale <= 22`), both operands are exact so a single
+/// IEEE division is already correctly rounded. Otherwise round once from the
+/// value's exact decimal digits, which Rust's `str::parse` does with correct
+/// rounding.
+fn decimal_native_to_f64<N, F>(as_float: &F, x: N, scale: i8) -> f64
+where
+    N: ToPrimitive + Copy + std::fmt::Display,
+    F: Fn(N) -> f64,
+{
+    if (0..=22).contains(&scale) {
+        if let Some(v) = x.to_i128() {
+            if v.unsigned_abs() < (1u128 << 53) {
+                return as_float(x) / 10_f64.powi(scale as i32);
+            }
+        }
+    }
+    match scaled_decimal_literal(&x.to_string(), scale).parse::<f64>() {
+        Ok(value) => value,
+        // The generated literal is always a valid float, so this is unreachable;
+        // keep the lossy result as a defensive fallback rather than a NaN.
+        Err(_) => as_float(x) / 10_f64.powi(scale as i32),
+    }
+}
+
+/// Correctly-rounded conversion of a decimal coefficient `x` at `scale` decimal
+/// places to `f32`. See [`decimal_native_to_f64`]; the fast path uses the `f32`
+/// exact-integer range (`2^24`) and the scale bound (`10^10 < 2^24`), and the
+/// fallback rounds the exact decimal literal straight to `f32` (avoiding the
+/// double rounding of going through `f64`).
+fn decimal_native_to_f32<N, F>(as_float: &F, x: N, scale: i8) -> f32
+where
+    N: ToPrimitive + Copy + std::fmt::Display,
+    F: Fn(N) -> f64,
+{
+    if (0..=10).contains(&scale) {
+        if let Some(v) = x.to_i128() {
+            if v.unsigned_abs() < (1u128 << 24) {
+                return (as_float(x) as f32) / 10_f32.powi(scale as i32);
+            }
+        }
+    }
+    match scaled_decimal_literal(&x.to_string(), scale).parse::<f32>() {
+        Ok(value) => value,
+        Err(_) => (as_float(x) / 10_f64.powi(scale as i32)) as f32,
+    }
+}
+
+/// Renders the signed integer coefficient `signed_digits` at `scale` decimal
+/// places as a plain decimal literal (e.g. `"475"` at scale 20 becomes
+/// `"0.00000000000000000475"`). A non-positive scale multiplies by `10^-scale`.
+fn scaled_decimal_literal(signed_digits: &str, scale: i8) -> String {
+    let (sign, magnitude) = match signed_digits.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", signed_digits),
+    };
+
+    if scale <= 0 {
+        let zeros = scale.unsigned_abs() as usize;
+        return format!("{sign}{magnitude}{}", "0".repeat(zeros));
+    }
+
+    let scale = scale.unsigned_abs() as usize;
+    if magnitude.len() > scale {
+        let split = magnitude.len() - scale;
+        format!("{sign}{}.{}", &magnitude[..split], &magnitude[split..])
+    } else {
+        // |value| < 1: pad the fraction with leading zeros out to the scale.
+        format!("{sign}0.{magnitude:0>scale$}")
     }
 }
 
@@ -10222,6 +10303,47 @@ mod tests {
         let result = result.as_primitive::<Float64Type>();
         assert!(result.value(0).is_finite());
         assert!(result.value(0) < 0.0); // Negative result
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/13978>.
+    ///
+    /// `Decimal -> Float` must round from the exact value, not by widening the
+    /// coefficient to the float before dividing. An undeclared PostgreSQL NUMERIC
+    /// read as `Decimal128(38, 20)` for an `avg` had its scale-20 coefficient
+    /// (always `> 2^53`) rounded on the way in, so `47.5` came back as
+    /// `47.50000000000001`.
+    #[test]
+    fn test_cast_decimal_to_float_is_correctly_rounded() {
+        // Decimal128(38, 20): 47.5 -> coefficient 4_750_000_000_000_000_000_000 (> 2^53).
+        let coeff: i128 = 475 * 10_i128.pow(19);
+        let array = create_decimal128_array(vec![Some(coeff)], 38, 20).unwrap();
+        let result = cast(&(Arc::new(array) as ArrayRef), &DataType::Float64).unwrap();
+        assert_eq!(result.as_primitive::<Float64Type>().value(0), 47.5);
+
+        // Confirm the old widen-then-divide arithmetic was actually wrong here.
+        let widened = coeff as f64 / 10_f64.powi(20);
+        assert_ne!(widened, 47.5);
+
+        // Decimal64(18, 7): a coefficient (> 2^53) that is *not* exactly
+        // representable, so widening rounds it one ULP off.
+        let array = create_decimal64_array(vec![Some(43_108_922_322_810_111)], 18, 7).unwrap();
+        let result = cast(&(Arc::new(array) as ArrayRef), &DataType::Float64).unwrap();
+        assert_eq!(
+            result.as_primitive::<Float64Type>().value(0).to_bits(),
+            0x41f0_0f2f_ec84_7f05
+        );
+
+        // Decimal256(50, 20): same 47.5 case through the i256 path.
+        let array = create_decimal256_array(vec![Some(i256::from_i128(coeff))], 50, 20).unwrap();
+        let result = cast(&(Arc::new(array) as ArrayRef), &DataType::Float64).unwrap();
+        assert_eq!(result.as_primitive::<Float64Type>().value(0), 47.5);
+
+        // Nulls survive, and small fast-path values still convert.
+        let array = create_decimal128_array(vec![Some(12_345_678), None], 38, 4).unwrap();
+        let result = cast(&(Arc::new(array) as ArrayRef), &DataType::Float64).unwrap();
+        let result = result.as_primitive::<Float64Type>();
+        assert_eq!(result.value(0), 1234.5678);
+        assert!(result.is_null(1));
     }
 
     #[test]
