@@ -10347,6 +10347,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_decimal_to_float32_avoids_double_rounding() {
+        // The reviewer asked for coverage of the Float32 fallback that parses the
+        // exact decimal literal straight to f32, rather than rounding to f64 and
+        // then to f32 (double rounding). This is a value where those two paths
+        // disagree: 17.88234233856201 sits just below an f32 midpoint, within half
+        // an f64 ULP of it, so:
+        //   "17.88234233856201".parse::<f32>()            -> 0x418f_0f09 (17.882341)
+        //   "17.88234233856201".parse::<f64>() as f32     -> 0x418f_0f0a (17.882343)
+        // The cast must produce the correctly-rounded f32, i.e. the first bit
+        // pattern. If the code ever widened through f64 it would yield the second.
+        let coeff: i128 = 1_788_234_233_856_201; // 17.88234233856201 at scale 14
+        let array = create_decimal128_array(vec![Some(coeff)], 16, 14).unwrap();
+        let result = cast(&(Arc::new(array) as ArrayRef), &DataType::Float32).unwrap();
+        let value = result.as_primitive::<Float32Type>().value(0);
+
+        // Correctly-rounded f32 (single rounding straight from the decimal digits).
+        assert_eq!(value.to_bits(), 0x418f_0f09);
+        assert_eq!(
+            value.to_bits(),
+            "17.88234233856201".parse::<f32>().unwrap().to_bits()
+        );
+
+        // The double-rounded f64->f32 path lands one ULP away; assert we did NOT
+        // take it, so this test fails if the fallback regresses to widening.
+        let double_rounded = "17.88234233856201".parse::<f64>().unwrap() as f32;
+        assert_eq!(double_rounded.to_bits(), 0x418f_0f0a);
+        assert_ne!(value.to_bits(), double_rounded.to_bits());
+    }
+
+    #[test]
     fn test_cast_decimal128_to_decimal128_negative_scale() {
         let input_type = DataType::Decimal128(20, 0);
         let output_type = DataType::Decimal128(20, -1);
