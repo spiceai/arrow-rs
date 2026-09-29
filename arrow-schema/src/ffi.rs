@@ -171,7 +171,14 @@ impl FFI_ArrowSchema {
 
     /// Set the name of the schema
     pub fn with_name(mut self, name: &str) -> Result<Self, ArrowError> {
-        self.name = CString::new(name).unwrap().into_raw();
+        self.name = CString::new(name)
+            .map_err(|e| {
+                ArrowError::CDataInterface(format!(
+                    "Null byte at position {} not allowed in name",
+                    e.nul_position()
+                ))
+            })?
+            .into_raw();
         Ok(self)
     }
 
@@ -642,8 +649,9 @@ impl TryFrom<&FFI_ArrowSchema> for Field {
 
     fn try_from(c_schema: &FFI_ArrowSchema) -> Result<Self, ArrowError> {
         let dtype = DataType::try_from(c_schema)?;
-        let mut field = Field::new(c_schema.name().unwrap_or(""), dtype, c_schema.nullable());
-        field.set_metadata(c_schema.metadata()?);
+        let field = Field::new(c_schema.name().unwrap_or(""), dtype, c_schema.nullable())
+            .with_dict_is_ordered(c_schema.dictionary_ordered())
+            .with_metadata(c_schema.metadata()?);
         Ok(field)
     }
 }
@@ -975,6 +983,10 @@ mod tests {
 
         let arrow_schema = FFI_ArrowSchema::try_from(schema).unwrap();
         assert!(arrow_schema.child(0).dictionary_ordered());
+
+        // Round-trip: the ordered flag must be preserved when converting back to a Field.
+        let field = Field::try_from(arrow_schema.child(0)).unwrap();
+        assert_eq!(field.dict_is_ordered(), Some(true));
     }
 
     #[test]
@@ -1000,6 +1012,12 @@ mod tests {
             let field = Field::try_from(&schema).unwrap();
             assert_eq!(field.metadata(), &metadata);
         }
+    }
+
+    #[test]
+    fn test_name_with_null_byte() {
+        let schema = FFI_ArrowSchema::try_new("i", vec![], None).unwrap();
+        assert!(schema.with_name("ab\0cd").is_err());
     }
 
     #[test]
