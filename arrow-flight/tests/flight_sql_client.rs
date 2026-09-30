@@ -225,6 +225,8 @@ fn make_ingest_command() -> CommandStatementIngest {
 pub struct FlightSqlServiceImpl {
     transactions: Arc<Mutex<HashMap<String, ()>>>,
     ingested_batches: Arc<Mutex<Vec<RecordBatch>>>,
+    /// The metadata of the last `DoGet` request the fallback handler served.
+    do_get_metadata: Arc<Mutex<Option<tonic::metadata::MetadataMap>>>,
 }
 
 impl FlightSqlServiceImpl {
@@ -232,6 +234,7 @@ impl FlightSqlServiceImpl {
         Self {
             transactions: Arc::new(Mutex::new(HashMap::new())),
             ingested_batches: Arc::new(Mutex::new(Vec::new())),
+            do_get_metadata: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -252,6 +255,22 @@ impl Default for FlightSqlServiceImpl {
 #[tonic::async_trait]
 impl FlightSqlService for FlightSqlServiceImpl {
     type FlightService = FlightSqlServiceImpl;
+
+    async fn do_get_fallback(
+        &self,
+        request: Request<arrow_flight::Ticket>,
+        _message: arrow_flight::sql::Any,
+    ) -> Result<
+        tonic::Response<<Self as arrow_flight::flight_service_server::FlightService>::DoGetStream>,
+        Status,
+    > {
+        *self.do_get_metadata.lock().await = Some(request.metadata().clone());
+        let batch = make_primitive_batch(5);
+        let stream = FlightDataEncoderBuilder::new()
+            .build(futures::stream::iter(vec![Ok(batch)]))
+            .map_err(Status::from);
+        Ok(tonic::Response::new(Box::pin(stream)))
+    }
 
     async fn do_action_begin_transaction(
         &self,
@@ -303,4 +322,50 @@ impl FlightSqlService for FlightSqlServiceImpl {
         *self.ingested_batches.lock().await.as_mut() = batches;
         Ok(affected_rows)
     }
+}
+
+#[tokio::test]
+pub async fn test_do_get_flight_data_sends_headers_and_token() {
+    let test_server = FlightSqlServiceImpl::new();
+    let fixture = TestFixture::new(test_server.service()).await;
+    let channel = fixture.channel().await;
+    let mut flight_sql_client = FlightSqlServiceClient::new(channel);
+    flight_sql_client.set_header("x-test-header", "header-value");
+    flight_sql_client.set_token("secret-token".to_string());
+
+    // A ticket the server has no specific handler for, so it reaches `do_get_fallback`.
+    let ticket = arrow_flight::Ticket::new(
+        arrow_flight::sql::Any {
+            type_url: "type.googleapis.com/test.Unknown".to_string(),
+            value: Default::default(),
+        }
+        .encode_to_vec(),
+    );
+    let response = flight_sql_client
+        .do_get_flight_data(ticket)
+        .await
+        .expect("do_get_flight_data");
+
+    let batches: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
+        response.into_inner().map_err(FlightError::from),
+    )
+    .try_collect()
+    .await
+    .expect("the raw stream decodes");
+    assert_eq!(batches, vec![make_primitive_batch(5)]);
+
+    let metadata = test_server
+        .do_get_metadata
+        .lock()
+        .await
+        .clone()
+        .expect("the server saw a DoGet");
+    assert_eq!(
+        metadata.get("x-test-header").map(|v| v.to_str().unwrap()),
+        Some("header-value")
+    );
+    assert_eq!(
+        metadata.get("authorization").map(|v| v.to_str().unwrap()),
+        Some("Bearer secret-token")
+    );
 }
