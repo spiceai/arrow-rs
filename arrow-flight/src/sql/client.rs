@@ -291,6 +291,19 @@ where
         .with_trailers(trailers))
     }
 
+    /// Like [`Self::do_get`], but returns the raw [`FlightData`] stream instead of decoding it.
+    ///
+    /// The request carries this client's headers and bearer token, exactly as [`Self::do_get`]
+    /// sends them. This is for a caller that has to act on the messages before they are decoded,
+    /// such as rewriting a schema message the decoder would otherwise refuse.
+    pub async fn do_get_flight_data(
+        &mut self,
+        ticket: impl IntoRequest<Ticket>,
+    ) -> Result<tonic::Response<tonic::Streaming<FlightData>>> {
+        let req = self.set_request_headers(ticket.into_request())?;
+        Ok(self.flight_client.do_get(req).await?)
+    }
+
     /// Push a stream to the flight service associated with a particular flight stream.
     pub async fn do_put(
         &mut self,

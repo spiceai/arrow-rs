@@ -34,15 +34,15 @@
 //!
 //! This module exposes three layers of the API surface, from highest to lowest-level:
 //!
-//! * [`ReaderBuilder`](crate::reader::ReaderBuilder): configures how Avro is read (batch size, strict union handling,
+//! * [`ReaderBuilder`]: configures how Avro is read (batch size, strict union handling,
 //!   string representation, reader schema, etc.) and produces either:
 //!   * a `Reader` for **Avro Object Container Files (OCF)** read from any `BufRead`, or
 //!   * a low-level `Decoder` for **single‑object encoded** Avro bytes and Confluent
 //!     **Schema Registry** framed messages.
-//! * [`Reader`](crate::reader::Reader): a convenient, synchronous iterator over `RecordBatch` decoded from an OCF
+//! * [`Reader`]: a convenient, synchronous iterator over `RecordBatch` decoded from an OCF
 //!   input. Implements [`Iterator<Item = Result<RecordBatch, ArrowError>>`] and
 //!   `RecordBatchReader`.
-//! * [`Decoder`](crate::reader::Decoder): a push‑based row decoder that consumes SOE framed Avro bytes and yields ready
+//! * [`Decoder`]: a push‑based row decoder that consumes SOE framed Avro bytes and yields ready
 //!   `RecordBatch` values when batches fill. This is suitable for integrating with async
 //!   byte streams, network protocols, or other custom data sources.
 //!
@@ -504,10 +504,11 @@ pub mod async_reader;
 
 pub use header::{HeaderInfo, read_header_info};
 
+#[allow(deprecated)]
 #[cfg(feature = "object_store")]
 pub use async_reader::AvroObjectReader;
 #[cfg(feature = "async")]
-pub use async_reader::{AsyncAvroFileReader, AsyncFileReader};
+pub use async_reader::{AsyncAvroFileReader, AsyncFileReader, SpawnedReader};
 
 fn is_incomplete_data(err: &AvroError) -> bool {
     matches!(
@@ -6808,14 +6809,8 @@ mod test {
             .unwrap();
 
         // First row should be "ACTIVE", second row should be "PENDING"
-        assert_eq!(
-            status_values.value(status_col.key(0).unwrap() as usize),
-            "ACTIVE"
-        );
-        assert_eq!(
-            status_values.value(status_col.key(1).unwrap() as usize),
-            "PENDING"
-        );
+        assert_eq!(status_values.value(status_col.key(0).unwrap()), "ACTIVE");
+        assert_eq!(status_values.value(status_col.key(1).unwrap()), "PENDING");
 
         // Get backupStatus enum values (same as status)
         let backup_status_col = batch
@@ -6831,11 +6826,11 @@ mod test {
 
         // First row should be "INACTIVE", second row should be "ACTIVE"
         assert_eq!(
-            backup_status_values.value(backup_status_col.key(0).unwrap() as usize),
+            backup_status_values.value(backup_status_col.key(0).unwrap()),
             "INACTIVE"
         );
         assert_eq!(
-            backup_status_values.value(backup_status_col.key(1).unwrap() as usize),
+            backup_status_values.value(backup_status_col.key(1).unwrap()),
             "ACTIVE"
         );
 
@@ -6862,15 +6857,15 @@ mod test {
         // First row: ["PENDING", "ACTIVE", "INACTIVE"]
         assert_eq!(first_array_dict_array.len(), 3);
         assert_eq!(
-            first_array_values.value(first_array_dict_array.key(0).unwrap() as usize),
+            first_array_values.value(first_array_dict_array.key(0).unwrap()),
             "PENDING"
         );
         assert_eq!(
-            first_array_values.value(first_array_dict_array.key(1).unwrap() as usize),
+            first_array_values.value(first_array_dict_array.key(1).unwrap()),
             "ACTIVE"
         );
         assert_eq!(
-            first_array_values.value(first_array_dict_array.key(2).unwrap() as usize),
+            first_array_values.value(first_array_dict_array.key(2).unwrap()),
             "INACTIVE"
         );
     }
