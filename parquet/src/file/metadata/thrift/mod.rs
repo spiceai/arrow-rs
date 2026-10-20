@@ -51,7 +51,7 @@ use crate::{
     parquet_thrift::{
         ElementType, FieldType, ReadThrift, ThriftCompactInputProtocol,
         ThriftCompactOutputProtocol, ThriftSliceInputProtocol, WriteThrift, WriteThriftField,
-        read_thrift_vec, validate_list_type,
+        list_capacity, read_thrift_vec, validate_list_type,
     },
     schema::types::{
         ColumnDescriptor, SchemaDescriptor, TypePtr, num_nodes, parquet_schema_from_array,
@@ -812,7 +812,10 @@ pub(crate) fn parquet_metadata_from_bytes(
                 let list_ident = prot.read_list_begin()?;
                 // check for list of struct
                 validate_list_type(ElementType::Struct, &list_ident)?;
-                let mut rg_vec = Vec::with_capacity(list_ident.size as usize);
+                let mut rg_vec = Vec::with_capacity(list_capacity(
+                    list_ident.size as usize,
+                    prot.remaining_bytes(),
+                )?);
 
                 // Read row groups and handle ordinal assignment
                 let mut assigner = OrdinalAssigner::new();
@@ -1741,7 +1744,7 @@ write_thrift_field!(RustBoundingBox, FieldType::Struct);
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::basic::{Encoding, PageType, Type as PhysicalType};
-    use crate::errors::Result;
+    use crate::errors::{ParquetError, Result};
     use crate::file::metadata::thrift::{
         BoundingBox, DataPageHeaderV2, DictionaryPageHeader, PageHeader, SchemaElement,
         write_schema,
@@ -1752,6 +1755,7 @@ pub(crate) mod tests {
         ElementType, ThriftCompactOutputProtocol, ThriftSliceInputProtocol, WriteThrift,
         read_thrift_vec,
     };
+    use crate::schema::parser::parse_message_type;
     use crate::schema::types::{
         ColumnDescriptor, ColumnPath, SchemaDescriptor, TypePtr, num_nodes,
         parquet_schema_from_array,
@@ -2006,5 +2010,68 @@ pub(crate) mod tests {
         let err = DataPageHeaderV2::read_thrift_without_stats(&mut prot)
             .expect_err("malformed bool field should return an error");
         assert_malformed_bool_error(err);
+    }
+
+    /// Thrift varint encoding of `i32::MAX`, the largest list length a footer can declare.
+    const MAX_I32_VARINT: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF, 0x07];
+
+    /// `FileMetaData` field 1 (`version = 2`), for footers that must reach a later field.
+    const VERSION_FIELD: &[u8] = &[0x15, 0x04];
+
+    /// A declared list length the footer cannot satisfy is refused before anything is reserved.
+    /// Reserving the declared count instead asked for hundreds of gigabytes from a few bytes.
+    fn assert_declared_length_error(err: ParquetError) {
+        assert!(
+            err.to_string().contains("Thrift list declares"),
+            "expected a declared-length error, got {err}"
+        );
+    }
+
+    #[test]
+    fn oversized_schema_list_length_returns_error() {
+        // field 2 (schema): list<SchemaElement> declaring i32::MAX elements, none of them present
+        let footer: Vec<u8> = [&[0x29u8, 0xFC], MAX_I32_VARINT, &[0x00]].concat();
+        let err = super::parquet_metadata_from_bytes(&footer, None)
+            .expect_err("oversized schema list should return an error");
+        assert_declared_length_error(err);
+    }
+
+    #[test]
+    fn oversized_row_group_list_length_returns_error() {
+        let schema = Arc::new(parse_message_type("message root { required int32 a; }").unwrap());
+        let schema_buf = schema_to_buf(&schema).unwrap();
+        // Thrift compact field headers carry a delta from the previous field id: field 1 version,
+        // field 2 schema, field 3 num_rows, then field 4 row_groups declaring i32::MAX row groups,
+        // none of them present
+        let footer: Vec<u8> = [
+            VERSION_FIELD,
+            &[0x19u8],
+            schema_buf.as_slice(),
+            &[0x16, 0x00],
+            &[0x19, 0xFC],
+            MAX_I32_VARINT,
+        ]
+        .concat();
+        let err = super::parquet_metadata_from_bytes(&footer, None)
+            .expect_err("oversized row group list should return an error");
+        assert_declared_length_error(err);
+    }
+
+    #[test]
+    fn oversized_key_value_metadata_length_returns_error() {
+        // field 1 (version), then field 5 (key_value_metadata) declaring i32::MAX entries
+        let footer: Vec<u8> = [VERSION_FIELD, &[0x49u8, 0xFC], MAX_I32_VARINT].concat();
+        let err = super::parquet_metadata_from_bytes(&footer, None)
+            .expect_err("oversized key value metadata list should return an error");
+        assert_declared_length_error(err);
+    }
+
+    #[test]
+    fn oversized_column_orders_length_returns_error() {
+        // field 1 (version), then field 7 (column_orders) declaring i32::MAX entries
+        let footer: Vec<u8> = [VERSION_FIELD, &[0x69u8, 0xFC], MAX_I32_VARINT].concat();
+        let err = super::parquet_metadata_from_bytes(&footer, None)
+            .expect_err("oversized column orders list should return an error");
+        assert_declared_length_error(err);
     }
 }
