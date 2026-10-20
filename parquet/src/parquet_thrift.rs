@@ -739,7 +739,9 @@ pub(crate) fn list_capacity(declared_size: usize, remaining_bytes: Option<usize>
     if let Some(remaining_bytes) = remaining_bytes {
         if declared_size > remaining_bytes / MIN_BYTES_PER_LIST_ELEMENT {
             return Err(general_err!(
-                "Thrift list declares {declared_size} elements, which is more than the {remaining_bytes} bytes of input remaining"
+                "Thrift list declares {} elements, which is more than the {} bytes of input remaining",
+                declared_size,
+                remaining_bytes
             ));
         }
     }
@@ -1230,9 +1232,11 @@ pub(crate) mod tests {
         let mut prot = ThriftSliceInputProtocol::new(&data);
         let err = read_thrift_vec::<i64, ThriftSliceInputProtocol>(&mut prot)
             .expect_err("list with no elements should return an error");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("Thrift list declares"),
-            "expected a declared-length error, got {err}"
+            msg.contains("Thrift list declares 2147483647 elements")
+                && msg.contains("more than the 0 bytes of input remaining"),
+            "expected a declared-length error, got {msg}"
         );
     }
 
@@ -1260,7 +1264,11 @@ pub(crate) mod tests {
         for declared in [65, i32::MAX as usize] {
             let err = list_capacity(declared, Some(64))
                 .expect_err("declared count above the remaining input should fail");
-            assert!(err.to_string().contains("Thrift list declares"));
+            assert!(
+                err.to_string()
+                    .contains(&format!("declares {declared} elements")),
+                "got {err}"
+            );
         }
         assert!(list_capacity(i32::MAX as usize, Some(0)).is_err());
         // input of unknown length is capped, so the reservation does not scale with the count

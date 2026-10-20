@@ -2022,7 +2022,8 @@ pub(crate) mod tests {
     /// Reserving the declared count instead asked for hundreds of gigabytes from a few bytes.
     fn assert_declared_length_error(err: ParquetError) {
         assert!(
-            err.to_string().contains("Thrift list declares"),
+            err.to_string()
+                .contains("Thrift list declares 2147483647 elements"),
             "expected a declared-length error, got {err}"
         );
     }
