@@ -389,6 +389,34 @@ impl<R: 'static + ChunkReader> RowGroupReader for SerializedRowGroupReader<'_, R
     }
 }
 
+/// Pages at or below this uncompressed size are always allowed, regardless of how
+/// little compressed data backs them.
+const MIN_UNBOUNDED_PAGE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Maximum ratio between a page's declared uncompressed size and its compressed bytes
+/// for pages above [`MIN_UNBOUNDED_PAGE_SIZE`].
+const MAX_PAGE_DECOMPRESSION_RATIO: usize = 1000;
+
+/// Rejects a page whose declared uncompressed size is not backed by enough compressed
+/// bytes, before a buffer of that size is allocated. The header's size is untrusted
+/// and can be up to `i32::MAX`.
+fn verify_page_uncompressed_size(
+    uncompressed_page_size: usize,
+    compressed_len: usize,
+) -> Result<()> {
+    let max_allowed =
+        MIN_UNBOUNDED_PAGE_SIZE.max(compressed_len.saturating_mul(MAX_PAGE_DECOMPRESSION_RATIO));
+    if uncompressed_page_size > max_allowed {
+        return Err(general_err!(
+            "Page uncompressed size {} exceeds the maximum allowed {} for {} compressed bytes",
+            uncompressed_page_size,
+            max_allowed,
+            compressed_len
+        ));
+    }
+    Ok(())
+}
+
 /// Decodes a [`Page`] from the provided `buffer`
 pub(crate) fn decode_page(
     page_header: PageHeader,
@@ -443,6 +471,7 @@ pub(crate) fn decode_page(
             if offset > buffer.len() || offset > uncompressed_page_size {
                 return Err(general_err!("Invalid page header"));
             }
+            verify_page_uncompressed_size(uncompressed_page_size, buffer.len())?;
             let decompressed_size = uncompressed_page_size - offset;
             let mut decompressed = Vec::with_capacity(uncompressed_page_size);
             decompressed.extend_from_slice(&buffer[..offset]);
@@ -1181,12 +1210,15 @@ mod tests {
 
     use crate::basic::{self, BoundaryOrder, ColumnOrder, Encoding, SortOrder};
     use crate::column::reader::ColumnReader;
+    use crate::compression::CodecOptions;
     use crate::data_type::private::ParquetValueType;
     use crate::data_type::{AsBytes, FixedLenByteArrayType, Int32Type};
-    use crate::file::metadata::thrift::DataPageHeaderV2;
+    use crate::file::metadata::thrift::{DataPageHeader, DataPageHeaderV2};
     use crate::file::writer::SerializedFileWriter;
+    use crate::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
     use crate::record::RowAccessor;
     use crate::schema::parser::parse_message_type;
+    use crate::schema::types::SchemaDescriptor;
     use crate::util::test_common::file_util::{get_test_file, get_test_path};
 
     use super::*;
@@ -1255,6 +1287,105 @@ mod tests {
             err.to_string()
                 .contains("DataPage v2 header contains implausible values")
         );
+    }
+
+    // A ZSTD data page of `uncompressed_len` zero bytes, whose compressed body is a few KiB.
+    fn build_high_ratio_page(uncompressed_len: usize) -> (PageHeader, Bytes) {
+        let mut codec = create_codec(
+            basic::Compression::ZSTD(Default::default()),
+            &CodecOptions::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut compressed = Vec::new();
+        codec
+            .compress(&vec![0u8; uncompressed_len], &mut compressed)
+            .unwrap();
+        assert!(compressed.len() * MAX_PAGE_DECOMPRESSION_RATIO < uncompressed_len);
+        let header = PageHeader {
+            r#type: PageType::DATA_PAGE,
+            uncompressed_page_size: uncompressed_len.try_into().unwrap(),
+            compressed_page_size: compressed.len().try_into().unwrap(),
+            data_page_header: Some(DataPageHeader {
+                num_values: 0,
+                encoding: Encoding::PLAIN,
+                definition_level_encoding: Encoding::RLE,
+                repetition_level_encoding: Encoding::RLE,
+                statistics: None,
+            }),
+            index_page_header: None,
+            dictionary_page_header: None,
+            crc: None,
+            data_page_header_v2: None,
+        };
+        (header, Bytes::from(compressed))
+    }
+
+    #[test]
+    fn test_decode_page_rejects_oversized_uncompressed_size() {
+        let uncompressed_len = MIN_UNBOUNDED_PAGE_SIZE + 32 * 1024 * 1024;
+        let (header, buffer) = build_high_ratio_page(uncompressed_len);
+        let mut codec = create_codec(
+            basic::Compression::ZSTD(Default::default()),
+            &CodecOptions::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let Err(err) = decode_page(header, buffer, Type::INT64, Some(&mut codec)) else {
+            panic!("a page declaring {uncompressed_len} uncompressed bytes was decoded");
+        };
+        assert!(
+            err.to_string().contains("exceeds the maximum allowed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_page_reader_rejects_oversized_uncompressed_size() {
+        let uncompressed_len = MIN_UNBOUNDED_PAGE_SIZE + 32 * 1024 * 1024;
+        let (header, body) = build_high_ratio_page(uncompressed_len);
+
+        let mut data = Vec::new();
+        header
+            .write_thrift(&mut ThriftCompactOutputProtocol::new(&mut data))
+            .unwrap();
+        data.extend_from_slice(&body);
+
+        let schema =
+            Arc::new(parse_message_type("message schema { REQUIRED INT64 value; }").unwrap());
+        let schema = SchemaDescriptor::new(schema);
+        let metadata = ColumnChunkMetaData::builder(schema.column(0))
+            .set_compression(basic::Compression::ZSTD(Default::default()))
+            .set_encodings(vec![Encoding::PLAIN, Encoding::RLE])
+            .set_num_values(0)
+            .set_total_compressed_size(data.len() as i64)
+            .set_total_uncompressed_size(uncompressed_len as i64)
+            .set_data_page_offset(0)
+            .build()
+            .unwrap();
+
+        // Covers both the sequential and the offset-index reader paths.
+        let page_location = PageLocation {
+            offset: 0,
+            compressed_page_size: data.len() as i32,
+            first_row_index: 0,
+        };
+        for page_locations in [None, Some(vec![page_location])] {
+            let mut reader = SerializedPageReader::new(
+                Arc::new(Bytes::from(data.clone())),
+                &metadata,
+                0,
+                page_locations,
+            )
+            .unwrap();
+            let Err(err) = reader.get_next_page() else {
+                panic!("a page declaring {uncompressed_len} uncompressed bytes was decoded");
+            };
+            assert!(
+                err.to_string().contains("exceeds the maximum allowed"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
