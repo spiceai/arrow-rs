@@ -297,6 +297,11 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
     /// Skip the next `n` bytes of input.
     fn skip_bytes(&mut self, n: usize) -> ThriftProtocolResult<()>;
 
+    /// Number of bytes left in the input, or `None` if the input length is not known.
+    fn remaining_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Read a ULEB128 encoded unsigned varint from the input.
     fn read_vlq(&mut self) -> ThriftProtocolResult<u64> {
         // try the happy path first
@@ -590,6 +595,11 @@ impl<'b, 'a: 'b> ThriftCompactInputProtocol<'b> for ThriftSliceInputProtocol<'a>
         Ok(())
     }
 
+    #[inline]
+    fn remaining_bytes(&self) -> Option<usize> {
+        Some(self.buf.len())
+    }
+
     fn read_double(&mut self) -> ThriftProtocolResult<f64> {
         let slice = self.buf.get(..8).ok_or(ThriftProtocolError::Eof)?;
         self.buf = &self.buf[8..];
@@ -711,6 +721,33 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for &'a [u8] {
     }
 }
 
+/// A Thrift list element occupies at least this many bytes on the wire.
+const MIN_BYTES_PER_LIST_ELEMENT: usize = 1;
+
+/// Capacity reserved up front for a Thrift list. The list still grows as its elements are
+/// decoded, so only the up-front reservation is bounded.
+const LIST_PREALLOCATION_CAP: usize = 1024;
+
+/// Capacity to reserve for a Thrift list that declares `declared_size` elements.
+///
+/// A declared length is input data, not a trusted hint: it can far exceed the number of elements
+/// the input actually holds, and reserving it verbatim lets a few input bytes request an
+/// arbitrarily large allocation. When the input length is known, a declaration the remaining bytes
+/// cannot encode is malformed input (every element takes at least one byte) and nothing is
+/// reserved. The reservation is otherwise capped, and decoding grows the list as it needs to.
+pub(crate) fn list_capacity(declared_size: usize, remaining_bytes: Option<usize>) -> Result<usize> {
+    if let Some(remaining_bytes) = remaining_bytes {
+        if declared_size > remaining_bytes / MIN_BYTES_PER_LIST_ELEMENT {
+            return Err(general_err!(
+                "Thrift list declares {} elements, which is more than the {} bytes of input remaining",
+                declared_size,
+                remaining_bytes
+            ));
+        }
+    }
+    Ok(declared_size.min(LIST_PREALLOCATION_CAP))
+}
+
 /// Read a Thrift encoded [list] from the input protocol object.
 ///
 /// [list]: https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md#list-and-set
@@ -721,7 +758,10 @@ where
 {
     let list_ident = prot.read_list_begin()?;
     validate_list_type(T::ELEMENT_TYPE, &list_ident)?;
-    let mut res = Vec::with_capacity(list_ident.size as usize);
+    let mut res = Vec::with_capacity(list_capacity(
+        list_ident.size as usize,
+        prot.remaining_bytes(),
+    )?);
     for _ in 0..list_ident.size {
         let val = T::read_thrift(prot)?;
         res.push(val);
@@ -1181,6 +1221,62 @@ pub(crate) mod tests {
         let mut prot = ThriftSliceInputProtocol::new(&data);
         let result = prot.read_list_begin();
         assert!(result.is_err(), "expected error, got {result:?}");
+    }
+
+    /// A declared list size the input cannot encode must be refused before anything is reserved.
+    /// Reserving the declared count instead asked for tens of gigabytes from six input bytes.
+    #[test]
+    fn test_read_thrift_vec_size_above_remaining_input_slice() {
+        // list header: element_type=I64, 0xF=size follows; varint = i32::MAX. No elements follow.
+        let data = [0xF6u8, 0xFF, 0xFF, 0xFF, 0xFF, 0x07];
+        let mut prot = ThriftSliceInputProtocol::new(&data);
+        let err = read_thrift_vec::<i64, ThriftSliceInputProtocol>(&mut prot)
+            .expect_err("list with no elements should return an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Thrift list declares 2147483647 elements")
+                && msg.contains("more than the 0 bytes of input remaining"),
+            "expected a declared-length error, got {msg}"
+        );
+    }
+
+    /// An input of unknown length cannot be checked, so the declared size is capped and decoding
+    /// reports the truncated input instead. A [`Read`] reports it as an I/O error.
+    #[test]
+    fn test_read_thrift_vec_size_above_remaining_input_read() {
+        let data = [0xF6u8, 0xFF, 0xFF, 0xFF, 0xFF, 0x07];
+        let mut prot = ThriftReadInputProtocol::new(data.as_slice());
+        let err =
+            read_thrift_vec::<i64, _>(&mut prot).expect_err("list with no elements should fail");
+        assert!(
+            matches!(err, ParquetError::EOF(_) | ParquetError::External(_)),
+            "expected a decode error, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_list_capacity_bounds_declared_size() {
+        // a count the remaining input can encode is kept
+        assert_eq!(list_capacity(3, Some(64)).unwrap(), 3);
+        assert_eq!(list_capacity(64, Some(64)).unwrap(), 64);
+        assert_eq!(list_capacity(0, Some(0)).unwrap(), 0);
+        // a count it cannot encode is malformed input, and nothing is reserved for it
+        for declared in [65, i32::MAX as usize] {
+            let err = list_capacity(declared, Some(64))
+                .expect_err("declared count above the remaining input should fail");
+            assert!(
+                err.to_string()
+                    .contains(&format!("declares {declared} elements")),
+                "got {err}"
+            );
+        }
+        assert!(list_capacity(i32::MAX as usize, Some(0)).is_err());
+        // input of unknown length is capped, so the reservation does not scale with the count
+        assert_eq!(list_capacity(3, None).unwrap(), 3);
+        assert_eq!(
+            list_capacity(usize::MAX, None).unwrap(),
+            LIST_PREALLOCATION_CAP
+        );
     }
 
     #[test]
