@@ -1300,7 +1300,7 @@ pub(crate) fn parquet_schema_from_array<'a>(elements: Vec<SchemaElement<'a>>) ->
     let mut elements = elements.into_iter();
 
     while index < num_elements {
-        let t = schema_from_array_helper(&mut elements, num_elements, index)?;
+        let t = schema_from_array_helper(&mut elements, num_elements, index, 0)?;
         index = t.0;
         schema_nodes.push(t.1);
     }
@@ -1318,15 +1318,26 @@ pub(crate) fn parquet_schema_from_array<'a>(elements: Vec<SchemaElement<'a>>) ->
     Ok(schema_nodes.remove(0))
 }
 
+/// The deepest schema element, counting the root as depth 0, that a file's schema may contain.
+const MAX_SCHEMA_DEPTH: usize = 100;
+
 // recursive helper function for schema conversion
 fn schema_from_array_helper<'a>(
     elements: &mut IntoIter<SchemaElement<'a>>,
     num_elements: usize,
     index: usize,
+    depth: usize,
 ) -> Result<(usize, TypePtr)> {
     // Whether or not the current node is root (message type).
     // There is only one message type node in the schema tree.
     let is_root_node = index == 0;
+
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(general_err!(
+            "Parquet schema nesting depth exceeds the maximum of {}",
+            MAX_SCHEMA_DEPTH
+        ));
+    }
 
     if index >= num_elements {
         return Err(general_err!(
@@ -1403,7 +1414,8 @@ fn schema_from_array_helper<'a>(
             let mut fields = Vec::with_capacity(usize::try_from(n)?);
             let mut next_index = index + 1;
             for _ in 0..n {
-                let child_result = schema_from_array_helper(elements, num_elements, next_index)?;
+                let child_result =
+                    schema_from_array_helper(elements, num_elements, next_index, depth + 1)?;
                 next_index = child_result.0;
                 fields.push(child_result.1);
             }
@@ -2521,5 +2533,49 @@ mod tests {
         }];
         let result = parquet_schema_from_array(elements);
         assert!(result.unwrap_err().to_string().contains("Integer overflow"));
+    }
+
+    /// A schema of nested groups whose single leaf sits at `depth`.
+    fn nested_schema_elements(depth: usize) -> Vec<SchemaElement<'static>> {
+        let group = |repetition_type| SchemaElement {
+            r#type: None,
+            type_length: None,
+            repetition_type,
+            name: "g",
+            num_children: Some(1),
+            converted_type: None,
+            scale: None,
+            precision: None,
+            field_id: None,
+            logical_type: None,
+        };
+        let mut elements = vec![group(None)];
+        elements.extend((1..depth).map(|_| group(Some(Repetition::OPTIONAL))));
+        elements.push(SchemaElement {
+            r#type: Some(PhysicalType::INT64),
+            num_children: None,
+            name: "leaf",
+            ..group(Some(Repetition::OPTIONAL))
+        });
+        elements
+    }
+
+    #[test]
+    fn test_parquet_schema_from_array_accepts_max_depth() {
+        let schema = parquet_schema_from_array(nested_schema_elements(MAX_SCHEMA_DEPTH)).unwrap();
+        let descriptor = SchemaDescriptor::new(schema);
+        assert_eq!(descriptor.num_columns(), 1);
+        assert_eq!(descriptor.column(0).path().parts().len(), MAX_SCHEMA_DEPTH);
+    }
+
+    #[test]
+    fn test_parquet_schema_from_array_rejects_depth_past_max() {
+        let err =
+            parquet_schema_from_array(nested_schema_elements(MAX_SCHEMA_DEPTH + 1)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Parquet schema nesting depth exceeds the maximum of 100"),
+            "{err}"
+        );
     }
 }
