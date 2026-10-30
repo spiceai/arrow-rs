@@ -32,6 +32,11 @@ pub(crate) fn parse_data_type(val: &str) -> ArrowResult<DataType> {
 
 type ArrowResult<T> = Result<T, ArrowError>;
 
+/// Maximum nesting depth of a type string, such as `List(List(Int64))` (depth 3).
+///
+/// The parser is recursive, so this bounds its stack use. Real types use a few levels.
+const MAX_TYPE_NESTING_DEPTH: usize = 64;
+
 fn make_error(val: &str, msg: &str) -> ArrowError {
     let msg = format!(
         "Unsupported type '{val}'. Must be a supported arrow type name such as 'Int32' or 'Timestamp(ns)'. Error {msg}"
@@ -48,6 +53,7 @@ fn make_error_expected(val: &str, expected: &Token, actual: &Token) -> ArrowErro
 struct Parser<'a> {
     val: &'a str,
     tokenizer: Peekable<Tokenizer<'a>>,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -55,6 +61,7 @@ impl<'a> Parser<'a> {
         Self {
             val,
             tokenizer: Tokenizer::new(val).peekable(),
+            depth: 0,
         }
     }
 
@@ -73,6 +80,19 @@ impl<'a> Parser<'a> {
 
     /// parses the next full DataType
     fn parse_next_type(&mut self) -> ArrowResult<DataType> {
+        if self.depth >= MAX_TYPE_NESTING_DEPTH {
+            return Err(make_error(
+                self.val,
+                &format!("type is nested more than {MAX_TYPE_NESTING_DEPTH} levels deep"),
+            ));
+        }
+        self.depth += 1;
+        let data_type = self.parse_type_from_next_token();
+        self.depth -= 1;
+        data_type
+    }
+
+    fn parse_type_from_next_token(&mut self) -> ArrowResult<DataType> {
         match self.next_token()? {
             Token::SimpleType(data_type) => Ok(data_type),
             Token::Timestamp => self.parse_timestamp(),
@@ -1626,6 +1646,50 @@ mod test {
                     }
                 }
             }
+        }
+    }
+
+    fn nested_list(depth: usize) -> String {
+        format!(
+            "{}Int64{}",
+            "List(".repeat(depth - 1),
+            ")".repeat(depth - 1)
+        )
+    }
+
+    #[test]
+    fn parse_nested_type_at_max_depth() {
+        let mut expected = DataType::Int64;
+        for _ in 1..MAX_TYPE_NESTING_DEPTH {
+            expected = DataType::new_list(expected, true);
+        }
+        let parsed = parse_data_type(&nested_list(MAX_TYPE_NESTING_DEPTH)).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parse_nested_type_past_max_depth() {
+        let cases = [
+            nested_list(MAX_TYPE_NESTING_DEPTH + 1),
+            format!(
+                "{}Int64{}",
+                r#"Struct("a": "#.repeat(MAX_TYPE_NESTING_DEPTH),
+                ")".repeat(MAX_TYPE_NESTING_DEPTH)
+            ),
+            format!(
+                "{}Utf8{}",
+                "Dictionary(Int32, ".repeat(MAX_TYPE_NESTING_DEPTH),
+                ")".repeat(MAX_TYPE_NESTING_DEPTH)
+            ),
+        ];
+        for data_type_string in cases {
+            let err = parse_data_type(&data_type_string).unwrap_err();
+            assert!(matches!(err, ArrowError::ParseError(_)));
+            assert!(
+                err.to_string()
+                    .contains("type is nested more than 64 levels deep"),
+                "message: {err}"
+            );
         }
     }
 
