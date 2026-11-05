@@ -297,7 +297,11 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
     /// Skip the next `n` bytes of input.
     fn skip_bytes(&mut self, n: usize) -> ThriftProtocolResult<()>;
 
-    /// Number of bytes left in the input, or `None` if the input length is not known.
+    /// Remaining unread bytes, if this protocol is backed by a finite buffer.
+    ///
+    /// Used to reject Thrift collection sizes that cannot fit in the remaining
+    /// input before allocating. Also used by `list_capacity` (Spice #32) when
+    /// the input length is known.
     fn remaining_bytes(&self) -> Option<usize> {
         None
     }
@@ -758,6 +762,10 @@ where
 {
     let list_ident = prot.read_list_begin()?;
     validate_list_type(T::ELEMENT_TYPE, &list_ident)?;
+    // Spice #32: list_capacity bounds by remaining input and caps the
+    // reservation when the input length is unknown. Stronger than the
+    // upstream 59.3.2 check (apache/arrow-rs#11353), which only rejects
+    // when remaining is known and does not cap unknown-length inputs.
     let mut res = Vec::with_capacity(list_capacity(
         list_ident.size as usize,
         prot.remaining_bytes(),
@@ -1292,6 +1300,51 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Expected list element type of I32 but got Bool")
+        );
+    }
+
+    #[test]
+    fn test_read_thrift_vec_roundtrip_i32() {
+        // 2-element list of i32: header 0x25 (count=2, type=I32), two zigzag zeros.
+        let data = [0x25, 0x00, 0x00];
+        let mut prot = ThriftSliceInputProtocol::new(&data);
+        let result = read_thrift_vec::<i32, ThriftSliceInputProtocol>(&mut prot).unwrap();
+        assert_eq!(result, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_read_thrift_vec_size_exceeds_remaining_returns_err() {
+        // Header 0xE5: 14 i32 elements, no payload. After reading the header
+        // zero bytes remain, so this must error instead of reserving 14 slots
+        // (and, for a larger declared size, gigabytes).
+        // Message text is from Spice list_capacity (#32), which supersedes the
+        // upstream 59.3.2 check (apache/arrow-rs#11353) on this line.
+        let data = [0xE5];
+        let mut prot = ThriftSliceInputProtocol::new(&data);
+        let result = read_thrift_vec::<i32, ThriftSliceInputProtocol>(&mut prot);
+        assert!(result.is_err(), "expected error, got {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Thrift list declares 14 elements")
+                && err.contains("0 bytes of input remaining"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_read_thrift_vec_huge_declared_size_returns_err() {
+        // Compact list header: 0xF5 = I32 elements, size follows as a varint.
+        // 0xfc 0xfc 0xfc 0x33 decodes to 109_002_364 — the schema-list case
+        // from #10920 — with only two leftover bytes.
+        let data = [0xF5, 0xfc, 0xfc, 0xfc, 0x33, 0x00, 0x00];
+        let mut prot = ThriftSliceInputProtocol::new(&data);
+        let result = read_thrift_vec::<i32, ThriftSliceInputProtocol>(&mut prot);
+        assert!(result.is_err(), "expected error, got {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Thrift list declares 109002364 elements")
+                && err.contains("2 bytes of input remaining"),
+            "{err}"
         );
     }
 }
