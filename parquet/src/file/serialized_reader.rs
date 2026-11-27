@@ -417,11 +417,46 @@ fn verify_page_uncompressed_size(
     Ok(())
 }
 
+/// Rejects a dictionary page that declares more values than its PLAIN-encoded body
+/// can hold, before a reader allocates the declared count. `type_length` is the
+/// column's fixed width and is only read for `FIXED_LEN_BYTE_ARRAY`.
+fn verify_dictionary_page_num_values(
+    num_values: u32,
+    buffer_len: usize,
+    physical_type: Type,
+    type_length: i32,
+) -> Result<()> {
+    let max_values = match physical_type {
+        Type::BOOLEAN => buffer_len.saturating_mul(8),
+        Type::INT32 | Type::FLOAT => buffer_len / 4,
+        Type::INT64 | Type::DOUBLE => buffer_len / 8,
+        Type::INT96 => buffer_len / 12,
+        // Each value has a 4-byte length prefix.
+        Type::BYTE_ARRAY => buffer_len / 4,
+        Type::FIXED_LEN_BYTE_ARRAY => match usize::try_from(type_length) {
+            Ok(width) if width > 0 => buffer_len / width,
+            // Zero-width values take no bytes, so the body bounds no count.
+            _ => return Ok(()),
+        },
+    };
+    if num_values as usize > max_values {
+        return Err(general_err!(
+            "Dictionary page declares {} values but its {} bytes can hold at most {} {} values",
+            num_values,
+            buffer_len,
+            max_values,
+            physical_type
+        ));
+    }
+    Ok(())
+}
+
 /// Decodes a [`Page`] from the provided `buffer`
 pub(crate) fn decode_page(
     page_header: PageHeader,
     buffer: Bytes,
     physical_type: Type,
+    type_length: i32,
     decompressor: Option<&mut Box<dyn Codec>>,
 ) -> Result<Page> {
     // Verify the 32-bit CRC checksum of the page
@@ -501,9 +536,16 @@ pub(crate) fn decode_page(
                 ParquetError::General("Missing dictionary page header".to_string())
             })?;
             let is_sorted = dict_header.is_sorted.unwrap_or(false);
+            let num_values = dict_header.num_values.try_into()?;
+            verify_dictionary_page_num_values(
+                num_values,
+                buffer.len(),
+                physical_type,
+                type_length,
+            )?;
             Page::DictionaryPage {
                 buf: buffer,
-                num_values: dict_header.num_values.try_into()?,
+                num_values,
                 encoding: dict_header.encoding,
                 is_sorted,
             }
@@ -600,6 +642,9 @@ pub struct SerializedPageReader<R: ChunkReader> {
 
     /// Column chunk type.
     physical_type: Type,
+
+    /// Column's fixed width, used for `FIXED_LEN_BYTE_ARRAY`.
+    type_length: i32,
 
     state: SerializedPageReaderState,
 
@@ -705,6 +750,7 @@ impl<R: ChunkReader> SerializedPageReader<R> {
             decompressor,
             state,
             physical_type: meta.column_type(),
+            type_length: meta.column_descr().type_length(),
             context,
         })
     }
@@ -994,6 +1040,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         header,
                         buffer,
                         self.physical_type,
+                        self.type_length,
                         self.decompressor.as_mut(),
                     )?;
                     if page.is_data_page() {
@@ -1038,6 +1085,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         header,
                         bytes,
                         self.physical_type,
+                        self.type_length,
                         self.decompressor.as_mut(),
                     )?
                 }
@@ -1212,8 +1260,11 @@ mod tests {
     use crate::column::reader::ColumnReader;
     use crate::compression::CodecOptions;
     use crate::data_type::private::ParquetValueType;
-    use crate::data_type::{AsBytes, FixedLenByteArrayType, Int32Type};
-    use crate::file::metadata::thrift::{DataPageHeader, DataPageHeaderV2};
+    use crate::data_type::{
+        AsBytes, ByteArray, ByteArrayType, DataType, FixedLenByteArrayType, Int32Type, Int64Type,
+    };
+    use crate::encodings::decoding::{Decoder, PlainDecoder};
+    use crate::file::metadata::thrift::{DataPageHeader, DataPageHeaderV2, DictionaryPageHeader};
     use crate::file::writer::SerializedFileWriter;
     use crate::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
     use crate::record::RowAccessor;
@@ -1246,7 +1297,7 @@ mod tests {
         };
 
         let buffer = Bytes::new();
-        let err = decode_page(page_header, buffer, Type::INT32, None).unwrap_err();
+        let err = decode_page(page_header, buffer, Type::INT32, -1, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("DataPage v2 header contains implausible values")
@@ -1266,7 +1317,8 @@ mod tests {
             data_page_header_v2: None,
         };
         let buffer = Bytes::new();
-        let err = decode_page(page_header.clone(), buffer.clone(), Type::INT32, None).unwrap_err();
+        let err =
+            decode_page(page_header.clone(), buffer.clone(), Type::INT32, -1, None).unwrap_err();
         assert_eq!(
             err.to_string(),
             "Parquet error: Page type INDEX_PAGE is not supported"
@@ -1282,11 +1334,112 @@ mod tests {
             is_compressed: None,
             statistics: None,
         });
-        let err = decode_page(page_header, buffer, Type::INT32, None).unwrap_err();
+        let err = decode_page(page_header, buffer, Type::INT32, -1, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("DataPage v2 header contains implausible values")
         );
+    }
+
+    fn plain_dictionary_page_header(num_values: i32, body_len: usize) -> PageHeader {
+        PageHeader {
+            r#type: PageType::DICTIONARY_PAGE,
+            uncompressed_page_size: body_len.try_into().unwrap(),
+            compressed_page_size: body_len.try_into().unwrap(),
+            data_page_header: None,
+            index_page_header: None,
+            dictionary_page_header: Some(DictionaryPageHeader {
+                num_values,
+                encoding: Encoding::PLAIN,
+                is_sorted: None,
+            }),
+            crc: None,
+            data_page_header_v2: None,
+        }
+    }
+
+    // Decodes `body` as an uncompressed PLAIN dictionary page declaring `num_values`,
+    // then decodes the page's values.
+    fn decode_plain_dictionary_page<T: DataType>(
+        body: &[u8],
+        num_values: i32,
+        physical_type: Type,
+    ) -> Vec<T::T> {
+        let header = plain_dictionary_page_header(num_values, body.len());
+        let page = decode_page(
+            header,
+            Bytes::copy_from_slice(body),
+            physical_type,
+            -1,
+            None,
+        )
+        .unwrap();
+        let Page::DictionaryPage {
+            buf, num_values, ..
+        } = page
+        else {
+            panic!("expected a dictionary page");
+        };
+        let mut decoder = PlainDecoder::<T>::new(-1);
+        decoder.set_data(buf, num_values as usize).unwrap();
+        let mut values = vec![T::T::default(); num_values as usize];
+        assert_eq!(decoder.get(&mut values).unwrap(), num_values as usize);
+        values
+    }
+
+    fn assert_dictionary_page_refused(body: &[u8], num_values: i32, physical_type: Type) {
+        let header = plain_dictionary_page_header(num_values, body.len());
+        let err = decode_page(
+            header,
+            Bytes::copy_from_slice(body),
+            physical_type,
+            -1,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Parquet error: Dictionary page declares {num_values} values but its {} bytes \
+                 can hold at most {} {physical_type} values",
+                body.len(),
+                num_values - 1
+            )
+        );
+    }
+
+    #[test]
+    fn test_decode_page_bounds_int64_dictionary_by_its_body() {
+        let body: Vec<u8> = [7i64, -3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            decode_plain_dictionary_page::<Int64Type>(&body, 2, Type::INT64),
+            vec![7, -3]
+        );
+        assert_dictionary_page_refused(&body, 3, Type::INT64);
+    }
+
+    #[test]
+    fn test_decode_page_bounds_int32_dictionary_by_its_body() {
+        let body: Vec<u8> = [7i32, -3, 11]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_plain_dictionary_page::<Int32Type>(&body, 3, Type::INT32),
+            vec![7, -3, 11]
+        );
+        assert_dictionary_page_refused(&body, 4, Type::INT32);
+    }
+
+    #[test]
+    fn test_decode_page_bounds_byte_array_dictionary_by_its_body() {
+        // "a" then "", each with its 4-byte length prefix: 9 bytes hold at most 2 values.
+        let body = [1, 0, 0, 0, b'a', 0, 0, 0, 0];
+        assert_eq!(
+            decode_plain_dictionary_page::<ByteArrayType>(&body, 2, Type::BYTE_ARRAY),
+            vec![ByteArray::from("a"), ByteArray::from("")]
+        );
+        assert_dictionary_page_refused(&body, 3, Type::BYTE_ARRAY);
     }
 
     // A ZSTD data page of `uncompressed_len` zero bytes, whose compressed body is a few KiB.
@@ -1331,7 +1484,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let Err(err) = decode_page(header, buffer, Type::INT64, Some(&mut codec)) else {
+        let Err(err) = decode_page(header, buffer, Type::INT64, -1, Some(&mut codec)) else {
             panic!("a page declaring {uncompressed_len} uncompressed bytes was decoded");
         };
         assert!(
