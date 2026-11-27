@@ -435,8 +435,8 @@ fn verify_dictionary_page_num_values(
         Type::BYTE_ARRAY => buffer_len / 4,
         Type::FIXED_LEN_BYTE_ARRAY => match usize::try_from(type_length) {
             Ok(width) if width > 0 => buffer_len / width,
-            // Zero-width values take no bytes, so the body bounds no count.
-            _ => return Ok(()),
+            // Zero-width values take no bytes, so no body bounds their count.
+            _ => 0,
         },
     };
     if num_values as usize > max_values {
@@ -1440,6 +1440,28 @@ mod tests {
             vec![ByteArray::from("a"), ByteArray::from("")]
         );
         assert_dictionary_page_refused(&body, 3, Type::BYTE_ARRAY);
+    }
+
+    #[test]
+    fn test_decode_page_refuses_a_zero_width_dictionary_with_values() {
+        let decode = |num_values| {
+            decode_page(
+                plain_dictionary_page_header(num_values, 0),
+                Bytes::new(),
+                Type::FIXED_LEN_BYTE_ARRAY,
+                0,
+                None,
+            )
+        };
+        assert!(matches!(
+            decode(0).unwrap(),
+            Page::DictionaryPage { num_values: 0, .. }
+        ));
+        assert_eq!(
+            decode(1).unwrap_err().to_string(),
+            "Parquet error: Dictionary page declares 1 values but its 0 bytes can hold at most 0 \
+             FIXED_LEN_BYTE_ARRAY values"
+        );
     }
 
     // A ZSTD data page of `uncompressed_len` zero bytes, whose compressed body is a few KiB.
