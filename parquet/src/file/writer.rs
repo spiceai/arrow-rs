@@ -1544,7 +1544,7 @@ mod tests {
     fn test_page_writer_dict_pages() {
         let pages = [
             Page::DictionaryPage {
-                buf: Bytes::from(vec![1, 2, 3, 4, 5]),
+                buf: Bytes::from_iter([1i32, 2, 3, 4, 5].iter().flat_map(|v| v.to_le_bytes())),
                 num_values: 5,
                 encoding: Encoding::RLE_DICTIONARY,
                 is_sorted: false,

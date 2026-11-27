@@ -370,9 +370,21 @@ impl<T: DataType> DictDecoder<T> {
 
     /// Decodes and sets values for dictionary using `decoder` decoder.
     pub fn set_dict(&mut self, mut decoder: Box<dyn Decoder<T>>) -> Result<()> {
+        // The decoder's value count comes from an untrusted page header, so the
+        // dictionary grows only as values are decoded.
+        const BATCH_SIZE: usize = 1024;
         let num_values = decoder.values_left();
-        self.dictionary.resize(num_values, T::T::default());
-        let _ = decoder.get(&mut self.dictionary)?;
+        self.dictionary.clear();
+        while self.dictionary.len() < num_values {
+            let start = self.dictionary.len();
+            let batch = (num_values - start).min(BATCH_SIZE);
+            self.dictionary.resize(start + batch, T::T::default());
+            let read = decoder.get(&mut self.dictionary[start..])?;
+            if read < batch {
+                self.dictionary.truncate(start + read);
+                break;
+            }
+        }
         self.has_dictionary = true;
         Ok(())
     }
@@ -1580,6 +1592,28 @@ mod tests {
         let mut decoder = DictDecoder::<Int32Type>::new();
         let err = decoder.set_data(Bytes::new(), 10).unwrap_err();
         assert_eq!(err.to_string(), "EOF: Not enough bytes to decode bit_width");
+    }
+
+    #[test]
+    fn test_dict_decoder_set_dict_grows_with_decoded_values() {
+        let values: Vec<i32> = (0..2500).collect();
+        let body: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut dictionary = PlainDecoder::<Int32Type>::new(-1);
+        dictionary
+            .set_data(Bytes::from(body), values.len())
+            .unwrap();
+        let mut decoder = DictDecoder::<Int32Type>::new();
+        decoder.set_dict(Box::new(dictionary)).unwrap();
+        assert_eq!(decoder.dictionary, values);
+
+        // 8 bytes declaring 65536 values: refused without sizing the dictionary to the count.
+        let mut dictionary = PlainDecoder::<Int32Type>::new(-1);
+        dictionary
+            .set_data(Bytes::from(vec![0u8; 8]), 1 << 16)
+            .unwrap();
+        let mut decoder = DictDecoder::<Int32Type>::new();
+        assert!(decoder.set_dict(Box::new(dictionary)).is_err());
+        assert!(decoder.dictionary.capacity() < 1 << 16);
     }
 
     fn test_plain_decode<T: DataType>(
