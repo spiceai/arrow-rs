@@ -1599,14 +1599,18 @@ mod tests {
         let values: Vec<i32> = (0..2500).collect();
         let body: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let mut dictionary = PlainDecoder::<Int32Type>::new(-1);
-        dictionary.set_data(Bytes::from(body), values.len()).unwrap();
+        dictionary
+            .set_data(Bytes::from(body), values.len())
+            .unwrap();
         let mut decoder = DictDecoder::<Int32Type>::new();
         decoder.set_dict(Box::new(dictionary)).unwrap();
         assert_eq!(decoder.dictionary, values);
 
         // 8 bytes declaring 65536 values: refused without sizing the dictionary to the count.
         let mut dictionary = PlainDecoder::<Int32Type>::new(-1);
-        dictionary.set_data(Bytes::from(vec![0u8; 8]), 1 << 16).unwrap();
+        dictionary
+            .set_data(Bytes::from(vec![0u8; 8]), 1 << 16)
+            .unwrap();
         let mut decoder = DictDecoder::<Int32Type>::new();
         assert!(decoder.set_dict(Box::new(dictionary)).is_err());
         assert!(decoder.dictionary.capacity() < 1 << 16);
